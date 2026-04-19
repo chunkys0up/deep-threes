@@ -10,12 +10,13 @@ import re
 import shutil
 import subprocess
 import imageio_ffmpeg
-import supervision as sv
+
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
+import basketball_cv.run_model as run_model
+from db import fetch_shots, replace_video_session
 
-from db import query_shots, extract_shot_filter, shot_to_event
 
 # Load .env BEFORE reading any environment variables.
 load_dotenv(Path(__file__).parent / ".env")
@@ -36,9 +37,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-UPLOAD_DIR = Path("uploads")
+BASE_DIR = Path(__file__).resolve().parent
+UPLOAD_DIR = BASE_DIR / "Uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-ANNOTATED_DIR = Path("Annotated")
+ANNOTATED_DIR = BASE_DIR / "Annotated"
 ANNOTATED_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -140,7 +142,8 @@ def _build_system_instruction(user_query: str = "") -> str:
         )
     duration = _get_video_duration(video)
     all_events = _all_events(duration)
-    filtered_events, original_indices = _filter_events_by_query(all_events, user_query)
+    filtered_events, original_indices = _filter_events_by_query(
+        all_events, user_query)
 
     if not filtered_events:
         events_block = "  (no events available)"
@@ -254,7 +257,8 @@ def _filter_events_by_query(
         # Align matches back onto the full events list by timestamp so the
         # indices we hand to the frontend are indices into VideoPlayer's
         # timestamps state (which was built from ALL shots).
-        match_times = {round(float(s.get("timestamp") or 0), 2) for s in matched_shots}
+        match_times = {round(float(s.get("timestamp") or 0), 2)
+                       for s in matched_shots}
         filtered_events = []
         original_indices = []
         for idx, ev in enumerate(events):
@@ -311,52 +315,12 @@ async def video_info():
 
 @app.get("/api/video/timestamps")
 async def video_timestamps(duration: float):
-    return _all_events(duration)
+    return _placeholder_timestamps(duration)
 
 
-# Small placeholder roster shown when `deep_threes.shots` is empty so the
-# frontend editor has something to render before the CV pipeline lands.
-_PLACEHOLDER_ROSTER = [
-    {
-        "team_color": "Boston Celtics",
-        "jerseys": [0, 7, 8, 11, 23, 42],
-    },
-    {
-        "team_color": "New York Knicks",
-        "jerseys": [1, 8, 11, 22, 30],
-    },
-]
-
-
-@app.get("/api/players")
-async def players():
-    """Roster scrape — distinct (team_color, jersey_number) pairs from the
-    shots collection. Used by the jersey-name editor drawer.
-    Empty collection → placeholder roster so the UI is still exploreable."""
-    shots = query_shots()
-    if not shots:
-        return {"teams": _PLACEHOLDER_ROSTER}
-
-    # Group jerseys by team, dedupe, sort.
-    by_team: dict[str, set[int]] = {}
-    for s in shots:
-        team = (s.get("team_color") or "").strip()
-        jersey = s.get("jersey_number")
-        if not team or jersey is None:
-            continue
-        try:
-            by_team.setdefault(team, set()).add(int(jersey))
-        except (TypeError, ValueError):
-            continue
-
-    if not by_team:
-        return {"teams": _PLACEHOLDER_ROSTER}
-
-    teams = [
-        {"team_color": team, "jerseys": sorted(jerseys)}
-        for team, jerseys in sorted(by_team.items())
-    ]
-    return {"teams": teams}
+@app.get("/api/shots")
+async def get_shots():
+    return fetch_shots()
 
 
 @app.post("/videoUpload")
@@ -369,8 +333,15 @@ async def videoUpload(
         raise HTTPException(status_code=415, detail="Unsupported Media Type")
 
     ext = Path(file.filename or "").suffix.lower()
-    filename = f"video{ext}"
+    filename = f"input{ext}"
     dest = UPLOAD_DIR / filename
+    outputFilename = f"output{ext}"
+    annotated_dest = ANNOTATED_DIR / outputFilename
+
+    if dest.exists():
+        dest.unlink()
+    if annotated_dest.exists():
+        annotated_dest.unlink()
 
     with dest.open("wb") as buffer:
         while chunk := await file.read(1024 * 1024):
@@ -378,24 +349,20 @@ async def videoUpload(
 
     await file.close()
 
-    # ------------------------------------------------------------------
-    # DEMO BRIDGE — until the CV pipeline is wired in.
-    # Transcode the raw upload into a web-playable H.264/AAC mp4 and put
-    # the result in Annotated/. Browsers refuse anything other than H.264
-    # (FMP4/XviD, HEVC, ProRes, etc. all fail silently), so this step is
-    # required even once real annotation lands — unless the CV pipeline
-    # already emits H.264. Fallback to raw copy if ffmpeg blows up, so
-    # the player at least has something to try.
-    # ------------------------------------------------------------------
-    annotated_dest = ANNOTATED_DIR / filename
-    if not _transcode_to_h264(dest, annotated_dest):
-        shutil.copy2(dest, annotated_dest)
+    shots = run_model.run_model(str(dest), str(annotated_dest))
+    shot_count = replace_video_session(
+        shots,
+        source_video=dest.name,
+        annotated_video=annotated_dest.name,
+    )
 
     return {
         "message": "uploaded",
         "title": title,
         "original_filename": filename,
-        "stored_as": filename,
+        "stored_as": dest.name,
+        "annotated_filename": annotated_dest.name,
+        "shots_stored": shot_count,
         "content_type": file.content_type,
     }
 
