@@ -11,10 +11,11 @@ import shutil
 import subprocess
 import imageio_ffmpeg
 import supervision as sv
-import pymongo
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
+
+from db import query_shots, extract_shot_filter, shot_to_event
 
 # Load .env BEFORE reading any environment variables.
 load_dotenv(Path(__file__).parent / ".env")
@@ -115,7 +116,7 @@ def _fmt_mmss(seconds: float) -> str:
     return f"{m}:{s:02d}"
 
 
-def _build_system_instruction() -> str:
+def _build_system_instruction(user_query: str = "") -> str:
     base = (
         "You are the AI assistant for Deep Court Analytics — a basketball "
         "computer-vision tool used by coaches and analysts. "
@@ -126,26 +127,41 @@ def _build_system_instruction() -> str:
         "STRUCTURED OUTPUT CONTRACT:\n"
         " - Always return valid JSON: { text: string, highlights: number[] }.\n"
         " - `text` is your natural-language reply.\n"
-        " - `highlights` is a list of INTEGER INDICES into the events table "
-        "below. Return indices for events that match the user's query — "
-        "e.g. 'show me the turnovers', 'shots from long range', 'first basket'. "
-        "Return an EMPTY array for greetings, summaries, or questions that "
-        "aren't about specific events."
+        " - `highlights` is a list of INTEGER INDICES — use the `[N]` values "
+        "shown in brackets in the events table below. Return indices for events "
+        "that match the user's query. Return an EMPTY array for greetings, "
+        "summaries, or questions that aren't about specific events."
     )
     video = _find_annotated_video()
     if video is None:
-        return base + "\n\nThere is no video loaded right now. The events table is empty — always return `highlights: []`."
+        return (
+            base
+            + "\n\nThere is no video loaded right now. The events table is empty — always return `highlights: []`."
+        )
     duration = _get_video_duration(video)
-    events = _placeholder_timestamps(duration)
-    lines = "\n".join(
-        f"  [{i}] {_fmt_mmss(e['time'])} — {e['description']}"
-        for i, e in enumerate(events)
+    all_events = _all_events(duration)
+    filtered_events, original_indices = _filter_events_by_query(all_events, user_query)
+
+    if not filtered_events:
+        events_block = "  (no events available)"
+    else:
+        events_block = "\n".join(
+            f"  [{idx}] {_fmt_mmss(ev['time'])} — {ev['description']}"
+            for idx, ev in zip(original_indices, filtered_events)
+        )
+
+    scope_note = (
+        "showing all events"
+        if len(filtered_events) == len(all_events)
+        else f"pre-filtered by the user's query — {len(filtered_events)} of {len(all_events)} events shown"
     )
+
     return (
         f"{base}\n\n"
         f"A video is currently loaded: {video.name} "
         f"({_fmt_mmss(duration)} long).\n"
-        f"Events table (placeholder until CV pipeline lands — indices are 0-based):\n{lines}"
+        f"Events table ({scope_note}; bracketed numbers are the INDICES to use in "
+        f"`highlights`):\n{events_block}"
     )
 
 
@@ -195,6 +211,76 @@ def _placeholder_timestamps(duration: float) -> list[dict]:
     ]
 
 
+def _all_events(duration: float) -> list[dict]:
+    """Full event list for the currently loaded video.
+
+    Preference order:
+      1. Mongo `shots` collection — when the CV pipeline has written data
+      2. Placeholder events — so the demo works before real CV output lands
+    """
+    shots = query_shots()
+    if shots:
+        return [shot_to_event(s, seed=i + 1) for i, s in enumerate(shots)]
+    return _placeholder_timestamps(duration)
+
+
+def _filter_events_by_query(
+    events: list[dict], user_query: str
+) -> tuple[list[dict], list[int]]:
+    """Keyword-filter an event list against the user's natural-language query.
+
+    Returns `(filtered_events, original_indices)` where:
+      - filtered_events are the events that matched (preserving order)
+      - original_indices[i] = index of filtered_events[i] in the full `events`
+        list. This is what gets surfaced to Gemini so the highlights it emits
+        still line up with the frontend's seekbar.
+
+    Implementation note: the real keyword→Mongo translation lives in
+    `db.extract_shot_filter`; this function re-queries Mongo with that filter
+    and maps results back to their position in the full list by timestamp.
+    If Mongo is empty (placeholder mode), we substring-match the description.
+    """
+    if not user_query:
+        return events, list(range(len(events)))
+
+    mongo_filter = extract_shot_filter(user_query)
+    if not mongo_filter:
+        # No keywords matched → no filter, Gemini sees everything.
+        return events, list(range(len(events)))
+
+    # Try Mongo-side filter first so we actually hit the shots collection.
+    matched_shots = query_shots(mongo_filter)
+    if matched_shots:
+        # Align matches back onto the full events list by timestamp so the
+        # indices we hand to the frontend are indices into VideoPlayer's
+        # timestamps state (which was built from ALL shots).
+        match_times = {round(float(s.get("timestamp") or 0), 2) for s in matched_shots}
+        filtered_events = []
+        original_indices = []
+        for idx, ev in enumerate(events):
+            if round(ev["time"], 2) in match_times:
+                filtered_events.append(ev)
+                original_indices.append(idx)
+        if filtered_events:
+            return filtered_events, original_indices
+
+    # Fallback path — no Mongo data, so keyword-match the description text.
+    q_lower = user_query.lower()
+    tokens = [t for t in q_lower.replace("-", " ").split() if len(t) > 2]
+    filtered_events = []
+    original_indices = []
+    for idx, ev in enumerate(events):
+        desc = ev["description"].lower()
+        if any(t in desc for t in tokens):
+            filtered_events.append(ev)
+            original_indices.append(idx)
+    if filtered_events:
+        return filtered_events, original_indices
+
+    # Nothing matched — hand back everything; Gemini can say so.
+    return events, list(range(len(events)))
+
+
 @app.get("/")
 async def root():
     return {"message": "Hello World"}
@@ -217,13 +303,15 @@ async def video_info():
             "title": video.name,
             "url": f"http://localhost:8000/videoSend/{video.name}",
         },
-        "timestamps": _placeholder_timestamps(duration),
+        # Mongo-first; placeholder when the shots collection is empty so the
+        # demo still has something to render before the CV pipeline wires in.
+        "timestamps": _all_events(duration),
     }
 
 
 @app.get("/api/video/timestamps")
 async def video_timestamps(duration: float):
-    return _placeholder_timestamps(duration)
+    return _all_events(duration)
 
 
 @app.post("/videoUpload")
@@ -344,7 +432,9 @@ def _call_gemini(req: ChatRequest) -> tuple[str, list[int]]:
     # the separate `system_instruction` config field with
     # "Developer instruction is not enabled for models/gemma-*".
     # Inlining works equally well for both Gemma and Gemini models.
-    system_txt = _build_system_instruction()
+    # Pass req.message so the system prompt can pre-filter the shots table
+    # against the user's keywords via Mongo.
+    system_txt = _build_system_instruction(req.message)
     inlined_message = f"{system_txt}\n\n---\n\nUser message: {req.message}"
 
     recent = req.history[-20:]
