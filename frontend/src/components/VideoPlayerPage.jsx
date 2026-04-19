@@ -1,24 +1,27 @@
 import { useCallback, useState } from 'react'
 import VideoPlayer from './VideoPlayer'
 import Chatbot from './Chatbot'
+import JerseyEditor from './JerseyEditor'
 
 export default function VideoPlayerPage() {
   const [theaterMode, setTheaterMode] = useState(false)
 
   // Shared video state between the player and the chatbot.
-  // - timestamps: the full list of events on the loaded video (for Gemini context)
-  // - highlightFilter: null = show all, int[] = only show these indices
-  // - videoReadyKey: bumps when a new video becomes ready, triggers auto-summary once
   const [timestamps, setTimestamps] = useState([])
   const [highlightFilter, setHighlightFilter] = useState(null)
   const [videoReadyKey, setVideoReadyKey] = useState(null)
 
+  // Jersey editor toggles a drawer below the video.
+  const [jerseyEditorOpen, setJerseyEditorOpen] = useState(false)
+
   const handleTimestampsChange = useCallback((ts, key) => {
     setTimestamps(ts || [])
-    // Any time new timestamps arrive (new video, or duration-refined refetch),
-    // drop any active highlight filter so the user starts from a clean view.
     setHighlightFilter(null)
     setVideoReadyKey(key)
+  }, [])
+
+  const toggleJerseyEditor = useCallback(() => {
+    setJerseyEditorOpen((o) => !o)
   }, [])
 
   return (
@@ -27,13 +30,22 @@ export default function VideoPlayerPage() {
         theaterMode ? 'theater' : ''
       }`}
     >
-      <div className="flex-1 min-w-0 min-h-0 flex items-center">
-        <VideoPlayer
-          isTheaterMode={theaterMode}
-          onTheaterToggle={() => setTheaterMode((t) => !t)}
-          highlightFilter={highlightFilter}
-          onTimestampsChange={handleTimestampsChange}
-        />
+      {/* Left column — video on top; jersey editor drawer underneath when open */}
+      <div className="flex-1 min-w-0 min-h-0 flex flex-col gap-4">
+        <div className="flex-1 min-h-0 flex items-center">
+          <VideoPlayer
+            isTheaterMode={theaterMode}
+            onTheaterToggle={() => setTheaterMode((t) => !t)}
+            highlightFilter={highlightFilter}
+            onTimestampsChange={handleTimestampsChange}
+          />
+        </div>
+
+        {jerseyEditorOpen && (
+          <div className="flex-shrink-0 max-h-[45%] overflow-hidden">
+            <JerseyEditor onClose={() => setJerseyEditorOpen(false)} />
+          </div>
+        )}
       </div>
 
       {!theaterMode && (
@@ -43,6 +55,8 @@ export default function VideoPlayerPage() {
             highlightFilter={highlightFilter}
             setHighlightFilter={setHighlightFilter}
             videoReadyKey={videoReadyKey}
+            jerseyEditorOpen={jerseyEditorOpen}
+            onToggleJerseyEditor={toggleJerseyEditor}
           />
         </div>
       )}

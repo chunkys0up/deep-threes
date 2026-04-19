@@ -235,6 +235,30 @@ def run_model(source_video_path: str, target_video_path: str) -> List[Shot]:
     return shots
 
 
+def _persist_shots_to_mongo(shots: List[Shot]) -> None:
+    """Push the run's shots into deep_threes.shots so the web app can read them.
+    Silent no-op if Mongo isn't reachable — the pipeline shouldn't break just
+    because the DB isn't running."""
+    from dataclasses import asdict
+    try:
+        import pymongo
+    except ImportError:
+        print("[db] pymongo not installed; skipping Mongo write")
+        return
+    try:
+        client = pymongo.MongoClient(
+            "mongodb://localhost:27017/", serverSelectionTimeoutMS=2000
+        )
+        coll = client["deep_threes"]["shots"]
+        # Fresh roster per run — drop this delete if you want append-only history.
+        coll.delete_many({})
+        if shots:
+            coll.insert_many([asdict(s) for s in shots])
+        print(f"[db] Wrote {len(shots)} shots → deep_threes.shots")
+    except Exception as e:
+        print(f"[db] Mongo write skipped ({e.__class__.__name__}: {e})")
+
+
 if __name__ == "__main__":
     import sys
 
@@ -247,3 +271,5 @@ if __name__ == "__main__":
     shots = run_model(source_video_path=source, target_video_path=target)
     for shot in shots:
         print(shot)
+
+    _persist_shots_to_mongo(shots)

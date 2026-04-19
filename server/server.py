@@ -314,6 +314,51 @@ async def video_timestamps(duration: float):
     return _all_events(duration)
 
 
+# Small placeholder roster shown when `deep_threes.shots` is empty so the
+# frontend editor has something to render before the CV pipeline lands.
+_PLACEHOLDER_ROSTER = [
+    {
+        "team_color": "Boston Celtics",
+        "jerseys": [0, 7, 8, 11, 23, 42],
+    },
+    {
+        "team_color": "New York Knicks",
+        "jerseys": [1, 8, 11, 22, 30],
+    },
+]
+
+
+@app.get("/api/players")
+async def players():
+    """Roster scrape — distinct (team_color, jersey_number) pairs from the
+    shots collection. Used by the jersey-name editor drawer.
+    Empty collection → placeholder roster so the UI is still exploreable."""
+    shots = query_shots()
+    if not shots:
+        return {"teams": _PLACEHOLDER_ROSTER}
+
+    # Group jerseys by team, dedupe, sort.
+    by_team: dict[str, set[int]] = {}
+    for s in shots:
+        team = (s.get("team_color") or "").strip()
+        jersey = s.get("jersey_number")
+        if not team or jersey is None:
+            continue
+        try:
+            by_team.setdefault(team, set()).add(int(jersey))
+        except (TypeError, ValueError):
+            continue
+
+    if not by_team:
+        return {"teams": _PLACEHOLDER_ROSTER}
+
+    teams = [
+        {"team_color": team, "jerseys": sorted(jerseys)}
+        for team, jerseys in sorted(by_team.items())
+    ]
+    return {"teams": teams}
+
+
 @app.post("/videoUpload")
 async def videoUpload(
     file: Annotated[UploadFile, File(...)],
