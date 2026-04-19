@@ -14,6 +14,36 @@ function HomeIcon() {
   )
 }
 
+function FilmIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+      <rect
+        x="3"
+        y="5"
+        width="18"
+        height="14"
+        rx="2"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.6"
+      />
+      <path
+        d="M7 5v14M17 5v14M3 9h4M17 9h4M3 15h4M17 15h4"
+        stroke="currentColor"
+        strokeWidth="1.4"
+        strokeLinecap="round"
+      />
+      <path
+        d="M10.5 9.5 14.5 12l-4 2.5z"
+        fill="currentColor"
+        stroke="currentColor"
+        strokeWidth="1"
+        strokeLinejoin="round"
+      />
+    </svg>
+  )
+}
+
 function TeamIcon() {
   return (
     <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
@@ -39,6 +69,7 @@ function TeamIcon() {
 
 const NAV_ITEMS = [
   { id: 'home', label: 'Home', Icon: HomeIcon },
+  { id: 'player', label: 'Film', Icon: FilmIcon },
   { id: 'about', label: 'About Us', Icon: TeamIcon },
 ]
 

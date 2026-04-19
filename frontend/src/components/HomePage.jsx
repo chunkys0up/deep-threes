@@ -50,7 +50,7 @@ const BACK_PATH_B = `
   C 2400,260 2640,230 2880,250
   L 2880,320 Z`
 
-export default function HomePage() {
+export default function HomePage({ onNavigate }) {
   return (
     <div className="page home-page">
       <div className="home-waves" aria-hidden="true">
@@ -88,6 +88,13 @@ export default function HomePage() {
           NBA computer vision, deep as the sea. Upload game footage and
           surface every possession, shot, and player track — automatically.
         </p>
+        <button
+          type="button"
+          className="home-cta"
+          onClick={() => onNavigate?.('player')}
+        >
+          Launch film room <span aria-hidden="true">→</span>
+        </button>
       </div>
     </div>
   )

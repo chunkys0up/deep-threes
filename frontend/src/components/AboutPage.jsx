@@ -38,12 +38,12 @@ function getInitials(name) {
 export default function AboutPage() {
   return (
     <div className="page about-page">
-      <div className="about-head">
+      <div className="page-head">
         <span className="section-eyebrow">The crew</span>
-        <h1 className="about-title">
+        <h1 className="page-title">
           About <em>us</em>
         </h1>
-        <p className="about-tag">
+        <p className="page-tag">
           Four people, one deep-sea dive into NBA computer vision.
         </p>
       </div>

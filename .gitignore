@@ -1,0 +1,30 @@
+# Python virtual environment
+venv/
+.venv/
+env/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Local video data — raw uploads and annotated outputs never get committed
+server/uploads/
+server/Uploads/
+server/Annotated/
+
+# Claude Code local state
+.claude/
+
+# Node (redundant with frontend/.gitignore but safe as a root fallback)
+node_modules/
+dist/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Editor state
+.vscode/*
+!.vscode/extensions.json
+.idea/

@@ -1,3 +1,5 @@
+@import "tailwindcss";
+
 :root {
   --bg-deep: #0a1128;
   --bg-rise: #0b1733;
@@ -52,6 +54,30 @@ body {
   margin: 0;
   background: var(--bg-deep);
   min-height: 100svh;
+}
+
+* {
+  scrollbar-color: var(--wave-mid) transparent;
+  scrollbar-width: thin;
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: var(--wave-mid);
+  border-radius: 6px;
+  border: 2px solid var(--bg-deep);
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--wave-cyan);
 }
 
 #root {

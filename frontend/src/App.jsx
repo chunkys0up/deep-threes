@@ -2,6 +2,7 @@ import { useState } from 'react'
 import Sidebar from './components/Sidebar'
 import HomePage from './components/HomePage'
 import AboutPage from './components/AboutPage'
+import VideoPlayerPage from './components/VideoPlayerPage'
 import './App.css'
 
 export default function App() {
@@ -11,7 +12,9 @@ export default function App() {
     <div className="app-shell">
       <Sidebar active={page} onSelect={setPage} />
       <main className="app-main">
-        {page === 'home' ? <HomePage /> : <AboutPage />}
+        {page === 'home' && <HomePage onNavigate={setPage} />}
+        {page === 'player' && <VideoPlayerPage />}
+        {page === 'about' && <AboutPage />}
       </main>
     </div>
   )
