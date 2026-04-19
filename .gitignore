@@ -16,6 +16,11 @@ server/Annotated/
 # Claude Code local state
 .claude/
 
+# Secrets — never commit API keys
+.env
+server/.env
+*.env.local
+
 # Node (redundant with frontend/.gitignore but safe as a root fallback)
 node_modules/
 dist/

@@ -3,12 +3,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated, Optional, Literal
+import os
 import shutil
 import subprocess
 import imageio_ffmpeg
 import supervision as sv
 import pymongo
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types as genai_types
+
+# Load .env BEFORE reading any environment variables.
+load_dotenv(Path(__file__).parent / ".env")
 
 app = FastAPI()
 
@@ -72,6 +79,63 @@ def _get_video_duration(path: Path) -> float:
 
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
+
+# --------------------------------------------------------------------
+# Gemini client — initialised once at module load.
+# Missing key isn't fatal: server still boots, /api/chat degrades to 500.
+# --------------------------------------------------------------------
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+_gemini_client: Optional["genai.Client"] = None
+if GEMINI_API_KEY:
+    try:
+        _gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+        print(f"[chat] Gemini client ready (model={GEMINI_MODEL})")
+    except Exception as e:
+        print(f"[chat] Failed to init Gemini client: {e}")
+        _gemini_client = None
+else:
+    print("[chat] GEMINI_API_KEY not set — /api/chat will return 500 until it is")
+
+
+class ChatMessage(BaseModel):
+    sender: Literal["user", "bot"]
+    text: str
+
+
+class ChatRequest(BaseModel):
+    message: str
+    history: list[ChatMessage] = []
+
+
+def _fmt_mmss(seconds: float) -> str:
+    m, s = divmod(int(seconds), 60)
+    return f"{m}:{s:02d}"
+
+
+def _build_system_instruction() -> str:
+    base = (
+        "You are the AI assistant for Deep Court Analytics — a basketball "
+        "computer-vision tool used by coaches and analysts. "
+        "Be concise, basketball-literate, and cite timestamps (mm:ss) when the "
+        "user asks about specific events. If no video is loaded, tell the user "
+        "to upload one on the Film page. If the user asks something you don't "
+        "have data for, say so honestly rather than guessing."
+    )
+    video = _find_annotated_video()
+    if video is None:
+        return base + "\n\nThere is no video loaded right now."
+    duration = _get_video_duration(video)
+    events = _placeholder_timestamps(duration)
+    lines = "\n".join(
+        f"- {_fmt_mmss(e['time'])} — {e['description']}" for e in events
+    )
+    return (
+        f"{base}\n\n"
+        f"A video is currently loaded: {video.name} "
+        f"({_fmt_mmss(duration)} long).\n"
+        f"Detected events (placeholder data until the CV pipeline lands):\n{lines}"
+    )
 
 
 def _transcode_to_h264(src: Path, dst: Path) -> bool:
@@ -201,6 +265,45 @@ async def send_video(filename: str):
         path=video_path,
         media_type="video/mp4",
     )
+
+
+@app.post("/api/chat")
+async def chat(req: ChatRequest):
+    """Send the user's message to Gemini with system prompt + truncated history."""
+    if _gemini_client is None:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "GEMINI_API_KEY not set on server. Create server/.env with "
+                "GEMINI_API_KEY=... and restart uvicorn."
+            ),
+        )
+
+    # Cap history to keep prompts small and bounded.
+    recent = req.history[-20:]
+
+    contents = []
+    for m in recent:
+        role = "user" if m.sender == "user" else "model"
+        contents.append({"role": role, "parts": [{"text": m.text}]})
+    contents.append({"role": "user", "parts": [{"text": req.message}]})
+
+    try:
+        response = _gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=contents,
+            config=genai_types.GenerateContentConfig(
+                system_instruction=_build_system_instruction(),
+            ),
+        )
+    except Exception as e:
+        print(f"[chat] Gemini call failed: {e}")
+        raise HTTPException(status_code=502, detail=f"Gemini upstream error: {e}")
+
+    text = (response.text or "").strip()
+    if not text:
+        text = "(no response)"
+    return {"text": text}
 
 
 @app.delete("/api/video")
