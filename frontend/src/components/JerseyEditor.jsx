@@ -34,6 +34,15 @@ export default function JerseyEditor({ onClose }) {
   const saveTimerRef = useRef(null);
   const teamSaveTimerRef = useRef(null);
 
+  // Close the modal on Escape.
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key === "Escape") onClose?.();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
   useEffect(() => {
     const fetchRoster = async () => {
       try {
@@ -81,7 +90,16 @@ export default function JerseyEditor({ onClose }) {
   const hasAnyJerseys = teams.some((t) => (t.jerseys || []).length > 0);
 
   return (
-    <div className="w-full h-full flex flex-col bg-[#0b1733] border border-[#1b3a6b] rounded-2xl shadow-[0_20px_60px_-20px_rgba(0,0,0,0.7)] overflow-hidden">
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-6 bg-black/60 backdrop-blur-sm"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Player jersey editor"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose?.();
+      }}
+    >
+    <div className="w-full max-w-3xl max-h-[80vh] flex flex-col bg-[#0b1733] border border-[#1b3a6b] rounded-2xl shadow-[0_30px_80px_-20px_rgba(0,0,0,0.85)] overflow-hidden">
       <header className="flex items-center justify-between gap-3 px-5 py-3 border-b border-[#1b3a6b] flex-shrink-0">
         <div className="flex items-center gap-3 min-w-0">
           <div className="p-2 rounded-lg bg-[#d9a441]/18 border border-[rgba(217,164,65,0.35)]">
@@ -187,6 +205,7 @@ export default function JerseyEditor({ onClose }) {
           </div>
         )}
       </div>
+    </div>
     </div>
   );
 }

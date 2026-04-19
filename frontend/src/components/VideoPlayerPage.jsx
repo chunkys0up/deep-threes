@@ -30,22 +30,13 @@ export default function VideoPlayerPage() {
         theaterMode ? 'theater' : ''
       }`}
     >
-      {/* Left column — video on top; jersey editor drawer underneath when open */}
-      <div className="flex-1 min-w-0 min-h-0 flex flex-col gap-4">
-        <div className="flex-1 min-h-0 flex items-center">
-          <VideoPlayer
-            isTheaterMode={theaterMode}
-            onTheaterToggle={() => setTheaterMode((t) => !t)}
-            highlightFilter={highlightFilter}
-            onTimestampsChange={handleTimestampsChange}
-          />
-        </div>
-
-        {jerseyEditorOpen && (
-          <div className="flex-shrink-0 max-h-[45%] overflow-hidden">
-            <JerseyEditor onClose={() => setJerseyEditorOpen(false)} />
-          </div>
-        )}
+      <div className="flex-1 min-w-0 min-h-0 flex items-center">
+        <VideoPlayer
+          isTheaterMode={theaterMode}
+          onTheaterToggle={() => setTheaterMode((t) => !t)}
+          highlightFilter={highlightFilter}
+          onTimestampsChange={handleTimestampsChange}
+        />
       </div>
 
       {!theaterMode && (
@@ -59,6 +50,10 @@ export default function VideoPlayerPage() {
             onToggleJerseyEditor={toggleJerseyEditor}
           />
         </div>
+      )}
+
+      {jerseyEditorOpen && (
+        <JerseyEditor onClose={() => setJerseyEditorOpen(false)} />
       )}
     </div>
   )
