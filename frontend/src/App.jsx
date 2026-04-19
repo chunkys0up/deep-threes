@@ -3,6 +3,7 @@ import Sidebar from './components/Sidebar'
 import HomePage from './components/HomePage'
 import AboutPage from './components/AboutPage'
 import VideoPlayerPage from './components/VideoPlayerPage'
+import GalleryPage from './components/GalleryPage'
 import './App.css'
 
 export default function App() {
@@ -14,6 +15,7 @@ export default function App() {
       <main className="app-main">
         {page === 'home' && <HomePage onNavigate={setPage} />}
         {page === 'player' && <VideoPlayerPage />}
+        {page === 'gallery' && <GalleryPage onNavigate={setPage} />}
         {page === 'about' && <AboutPage />}
       </main>
     </div>

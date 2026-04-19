@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from "react";
-import { Play, Pause, Volume2, VolumeX, Maximize, Minimize, ZoomIn, ZoomOut, X, AlertTriangle } from "lucide-react";
+import { Play, Pause, Volume2, VolumeX, Maximize, Minimize, ZoomIn, ZoomOut, X, AlertTriangle, BookmarkPlus, Check } from "lucide-react";
 
 const API_BASE_URL = "http://localhost:8000";
 
@@ -57,6 +57,7 @@ export default function VideoPlayer({
   const [uploading, setUploading] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const [playbackError, setPlaybackError] = useState(false);
+  const [gallerySaveState, setGallerySaveState] = useState("idle"); // idle | saving | saved | error
 
   const videoRef = useRef(null);
   const containerRef = useRef(null);
@@ -161,6 +162,31 @@ export default function VideoPlayer({
   const handleVideoError = () => {
     setPlaybackError(true);
     setIsPlaying(false);
+  };
+
+  const handleSaveToGallery = async () => {
+    if (gallerySaveState === "saving") return;
+    const title = window.prompt(
+      "Name this session for the Gallery:",
+      "My game clip",
+    );
+    if (!title) return; // cancelled
+    setGallerySaveState("saving");
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/gallery/save-current`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: title.trim() }),
+      });
+      if (!res.ok) throw new Error(`Save failed (${res.status})`);
+      setGallerySaveState("saved");
+      setTimeout(() => setGallerySaveState("idle"), 2500);
+    } catch (err) {
+      console.error(err);
+      setGallerySaveState("error");
+      setError(err.message || "Couldn't save to Gallery");
+      setTimeout(() => setGallerySaveState("idle"), 2500);
+    }
   };
 
   const handleDragOver = (e) => {
@@ -448,7 +474,30 @@ export default function VideoPlayer({
         <span className="text-[#f4ecd8] font-semibold text-sm tracking-wide" style={{ fontFamily: 'var(--heading)' }}>
           Film Room
         </span>
-        <span className="text-[#7a89a8] text-xs truncate">AI-powered play-by-play event timeline</span>
+        <span className="text-[#7a89a8] text-xs truncate flex-1 min-w-0">AI-powered play-by-play event timeline</span>
+        <button
+          type="button"
+          onClick={handleSaveToGallery}
+          disabled={gallerySaveState === "saving"}
+          title="Save this session to the Gallery"
+          className={`flex items-center gap-1.5 px-3 py-1 rounded text-xs font-medium transition-colors flex-shrink-0 border ${
+            gallerySaveState === "saved"
+              ? "bg-[rgba(0,122,51,0.18)] border-[rgba(0,122,51,0.5)] text-[#7ec29a]"
+              : "bg-[rgba(217,164,65,0.1)] border-[rgba(217,164,65,0.35)] text-[#d9a441] hover:bg-[rgba(217,164,65,0.22)] hover:border-[#d9a441]"
+          } ${gallerySaveState === "saving" ? "opacity-60 cursor-wait" : "cursor-pointer"}`}
+        >
+          {gallerySaveState === "saved" ? (
+            <>
+              <Check className="w-3.5 h-3.5" strokeWidth={2.4} />
+              Saved to Gallery
+            </>
+          ) : (
+            <>
+              <BookmarkPlus className="w-3.5 h-3.5" strokeWidth={2} />
+              {gallerySaveState === "saving" ? "Saving…" : "Save to Gallery"}
+            </>
+          )}
+        </button>
       </div>
 
       {error && (

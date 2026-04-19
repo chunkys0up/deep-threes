@@ -4,6 +4,7 @@ from tqdm import tqdm
 from typing import List, Tuple
 
 from sports import ConsecutiveValueTracker, TeamClassifier
+from .roboflow_client import infer_with_retry
 from .config import (
     PLAYER_DETECTION_MODEL_ID,
     NUMBER_RECOGNITION_MODEL_ID,
@@ -35,16 +36,27 @@ def fit_team_classifier(client) -> Tuple[TeamClassifier, List[np.ndarray]]:
         frame_generator = sv.get_video_frames_generator(source_path=video_path, stride=STRIDE)
 
         for frame in tqdm(frame_generator):
-            result = client.infer(frame, model_id=PLAYER_DETECTION_MODEL_ID)
+            result = infer_with_retry(client, frame, PLAYER_DETECTION_MODEL_ID)
+            if result is None:
+                # Skip this training frame entirely — fitting survives losing a few.
+                continue
             detections = sv.Detections.from_inference(result)
             detections = detections.with_nms(threshold=PLAYER_DETECTION_MODEL_IOU_THRESHOLD, class_agnostic=True)
             detections = detections[detections.confidence > PLAYER_DETECTION_MODEL_CONFIDENCE]
             detections = detections[np.isin(detections.class_id, PLAYER_CLASS_IDS)]
 
+            # Shrink each player bbox to 40% of its original size before
+            # cropping — the resulting patch is jersey+shorts only, no floor
+            # or head or referees, which makes the TeamClassifier's embedding
+            # space much cleaner. Mirrors the reference Colab; predict-time
+            # crops are deliberately left full-size (see classify_teams and
+            # run_model.py callback).
+            boxes = sv.scale_boxes(xyxy=detections.xyxy, factor=0.4)
+
             # Filter out zero-area / empty crops before feeding the team
             # classifier — cv2.cvtColor raises on empty input and kills the run.
-            for xyxy in detections.xyxy:
-                crop = sv.crop_image(frame, xyxy)
+            for box in boxes:
+                crop = sv.crop_image(frame, box)
                 if crop is None:
                     continue
                 if getattr(crop, "size", 0) == 0:
@@ -81,7 +93,11 @@ def recognize_jersey_numbers(
 ) -> ConsecutiveValueTracker:
     frame_h, frame_w, *_ = frame.shape
 
-    result_numbers = client.infer(frame, model_id=PLAYER_DETECTION_MODEL_ID)
+    result_numbers = infer_with_retry(client, frame, PLAYER_DETECTION_MODEL_ID)
+    if result_numbers is None:
+        # Missing one OCR frame just means jersey numbers stay uncorroborated
+        # for a bit longer — the ConsecutiveValueTracker handles that fine.
+        return number_validator
     number_detections = sv.Detections.from_inference(result_numbers)
     number_detections = number_detections[number_detections.class_id == NUMBER_CLASS_ID]
     number_detections.mask = sv.xyxy_to_mask(
@@ -95,8 +111,16 @@ def recognize_jersey_numbers(
 
     numbers_recognized = []
     for number_crop in number_crops:
-        jersey_number_result = client.infer(number_crop, model_id=NUMBER_RECOGNITION_MODEL_ID)
-        numbers_recognized.append(jersey_number_result["response"][">"])
+        jersey_number_result = infer_with_retry(
+            client, number_crop, NUMBER_RECOGNITION_MODEL_ID
+        )
+        if jersey_number_result is None:
+            numbers_recognized.append(None)
+            continue
+        try:
+            numbers_recognized.append(jersey_number_result["response"][">"])
+        except (KeyError, TypeError):
+            numbers_recognized.append(None)
 
     if len(player_detections) > 0 and len(number_detections) > 0:
         iou = sv.mask_iou_batch(

@@ -7,7 +7,7 @@ export const NBA_TEAMS = [
   { name: "Atlanta Hawks",          color: "#E03A3E" },
   { name: "Boston Celtics",         color: "#007A33" },
   { name: "Brooklyn Nets",          color: "#000000" },
-  { name: "Charlotte Hornets",      color: "#1D1160" },
+  { name: "Charlotte Hornets",      color: "#00788C" },
   { name: "Chicago Bulls",          color: "#CE1141" },
   { name: "Cleveland Cavaliers",    color: "#860038" },
   { name: "Dallas Mavericks",       color: "#00538C" },

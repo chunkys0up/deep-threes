@@ -29,23 +29,21 @@ _KMEANS_CRITERIA = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 8, 1.0)
 
 
 def _dominant_jersey_bgr(crop: np.ndarray) -> Optional[np.ndarray]:
-    """Pull the MOST-POPULAR color from the upper-torso region of a player crop.
+    """Pull the MOST-POPULAR color from a jersey crop.
 
-    Crop layout assumption: head ~top 15%, jersey ~next 35%, shorts below.
-    We sample the central x-band of the jersey zone, drop low-saturation
-    pixels (white numbers, skin, court) so hue comes from the fabric, then
-    k-means the remaining pixels into 3 clusters and return the centroid of
-    the largest cluster — the jersey's modal color. Returns BGR (OpenCV
-    convention) to match input."""
+    Assumes the input is already tight — the pipeline feeds us crops from
+    `sv.scale_boxes(xyxy=..., factor=0.4)` so the crop is roughly jersey +
+    shorts, no floor/head/referee. We drop low-saturation pixels (white
+    numbers, skin, court) so hue comes from the fabric, then k-means the
+    remaining pixels into 3 clusters and return the centroid of the largest
+    cluster — the jersey's modal color. Returns BGR (OpenCV convention)."""
     if crop is None or crop.size == 0:
         return None
     h, w = crop.shape[:2]
     if h < 10 or w < 10:
         return None
 
-    y0, y1 = int(h * 0.15), int(h * 0.55)
-    x0, x1 = int(w * 0.25), int(w * 0.75)
-    region = crop[y0:y1, x0:x1]
+    region = crop
     if region.size == 0:
         return None
 

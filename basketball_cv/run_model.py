@@ -4,7 +4,7 @@ from typing import List, Optional
 import numpy as np
 import supervision as sv
 
-from .roboflow_client import loadClient
+from .roboflow_client import loadClient, infer_with_retry
 from .config import *
 from .Shot import Shot
 from .KeyPointsSmoother import KeyPointsSmoother
@@ -15,12 +15,11 @@ from .jersey_number_team_detection import (
     init_number_validator,
 )
 from .team_identification import identify_nba_teams
+from .nba_teams import NBA_TEAMS
 from .annotate import (
     euclidean_distance,
     extract_xy,
     extract_class_id,
-    triangle_annotator,
-    text_annotator,
     triangle_annotator_missed,
     text_annotator_missed,
 )
@@ -66,6 +65,39 @@ def run_model(
     )
     team_names = {**TEAM_NAMES, **detected_team_names, **caller_overrides}
     print(f"[run_model] team_names resolved to: {team_names}")
+
+    # Build a dynamic color palette for shot-result overlays that matches the
+    # detected teams' brand colors (Celtics green for cluster 0, Knicks blue
+    # for cluster 1, etc.). Falls back to the original green/blue defaults if
+    # no NBA match is found. This is what paints the "5 ft (Paint)" pill on
+    # top of made shots — having it follow the real team means you see green
+    # on a Celtics shot regardless of which cluster they were classified as.
+    def _team_hex(team_name: str, default: str) -> str:
+        match = next((t for t in NBA_TEAMS if t["name"] == team_name), None)
+        return match["hex"] if match else default
+
+    team_0_hex = _team_hex(team_names.get(0, ""), "#007A33")  # Celtics green
+    team_1_hex = _team_hex(team_names.get(1, ""), "#006BB6")  # Knicks blue
+    made_palette = sv.ColorPalette.from_hex([team_0_hex, team_1_hex])
+    print(
+        f"[run_model] shot overlay palette: 0={team_0_hex} ({team_names.get(0)}), "
+        f"1={team_1_hex} ({team_names.get(1)})"
+    )
+
+    triangle_annotator = sv.TriangleAnnotator(
+        color=made_palette,
+        base=25,
+        height=21,
+        color_lookup=sv.ColorLookup.CLASS,
+    )
+    text_annotator = sv.RichLabelAnnotator(
+        font_size=60,
+        color=made_palette,
+        text_color=TEXT_COLOR,
+        text_offset=(0, -30),
+        color_lookup=sv.ColorLookup.CLASS,
+        text_position=sv.Position.TOP_CENTER,
+    )
     byte_tracker = sv.ByteTrack(frame_rate=30)
     number_validator = init_number_validator()
     shot_event_tracker = ShotEventTracker(
@@ -97,7 +129,12 @@ def run_model(
         current_time_seconds = index / video_info.fps
 
         # 1. Player detection + tracking
-        result_players = CLIENT.infer(frame, model_id=PLAYER_DETECTION_MODEL_ID)
+        result_players = infer_with_retry(CLIENT, frame, PLAYER_DETECTION_MODEL_ID)
+        if result_players is None:
+            # Roboflow upstream failure after retries — skip this frame entirely.
+            # We still return the raw frame so the output video doesn't have a gap.
+            print(f"[callback] frame {index}: player inference failed; skipping")
+            return frame.copy()
         initial_player_detections = sv.Detections.from_inference(result_players)
         has_jump_shot = len(
             initial_player_detections[
@@ -143,17 +180,24 @@ def run_model(
             recognize_jersey_numbers(frame, player_detections, number_validator, CLIENT)
 
         # 4. Court detection + view transformers
-        court_result = CLIENT.infer(frame, model_id=COURT_DETECTION_MODEL_ID)
-        key_points = sv.KeyPoints.from_inference(court_result)
-        key_points.xy = smoother.update(
-            xy=key_points.xy, confidence=key_points.confidence, conf_threshold=0.5
-        )
-
-        key_mask = key_points.confidence[0] > KEYPOINT_CONFIDENCE_THRESHOLD
-        have_enough_points = np.count_nonzero(key_mask) >= 4
-
+        # Court inference occasionally 524s on Roboflow's serverless endpoint.
+        # When it does, we skip this frame's keypoint update — the smoother
+        # still holds the previous frame's keypoints — and set
+        # `have_enough_points = False` so shot-location math is skipped too.
+        court_result = infer_with_retry(CLIENT, frame, COURT_DETECTION_MODEL_ID)
         image_to_court = None
         court_to_image = None
+        have_enough_points = False
+
+        if court_result is not None:
+            key_points = sv.KeyPoints.from_inference(court_result)
+            key_points.xy = smoother.update(
+                xy=key_points.xy, confidence=key_points.confidence, conf_threshold=0.5
+            )
+
+            key_mask = key_points.confidence[0] > KEYPOINT_CONFIDENCE_THRESHOLD
+            have_enough_points = np.count_nonzero(key_mask) >= 4
+
         if have_enough_points:
             court_vertices_masked = np.array(CONFIG.vertices)[key_mask]
             detected_on_image = key_points[:, key_mask].xy[0]

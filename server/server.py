@@ -10,6 +10,7 @@ import json
 import re
 import shutil
 import subprocess
+import uuid
 import imageio_ffmpeg
 
 # Put the project root on sys.path so `basketball_cv` (which lives one level
@@ -23,7 +24,18 @@ from google import genai
 from google.genai import types as genai_types
 # NOTE: basketball_cv.run_model is imported LAZILY inside /videoUpload so the
 # server can still boot even when Roboflow SDK deps aren't installed yet.
-from db import fetch_shots, replace_video_session, get_roster, save_roster, resolve_player
+from db import (
+    fetch_shots,
+    replace_video_session,
+    get_roster,
+    save_roster,
+    resolve_player,
+    save_gallery_session,
+    list_gallery_sessions,
+    get_gallery_session,
+    delete_gallery_session,
+    load_gallery_session_as_current,
+)
 
 
 # Load .env BEFORE reading any environment variables.
@@ -50,6 +62,10 @@ UPLOAD_DIR = BASE_DIR / "Uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 ANNOTATED_DIR = BASE_DIR / "Annotated"
 ANNOTATED_DIR.mkdir(parents=True, exist_ok=True)
+# Persistent archive of previous annotations — each session lives under its
+# own uuid-named subdirectory: Gallery/<session_id>/{input.mp4,output.mp4,thumb.jpg}.
+GALLERY_DIR = BASE_DIR / "Gallery"
+GALLERY_DIR.mkdir(parents=True, exist_ok=True)
 
 
 ALLOWED_EXTENSIONS = {"video/mp4"}
@@ -176,6 +192,32 @@ def _build_system_instruction(user_query: str = "") -> str:
         f"Events table ({scope_note}; bracketed numbers are the INDICES to use in "
         f"`highlights`):\n{events_block}"
     )
+
+
+def _extract_thumbnail(src: Path, dst: Path, at_seconds: float = 0.5) -> bool:
+    """Grab a single frame from `src` as a JPEG at `dst`.
+    Fast-seek (`-ss` before `-i`) so we don't have to decode the whole clip.
+    Returns True on success; failures are logged but non-fatal — the gallery
+    card just shows a default placeholder if the thumb is missing."""
+    cmd = [
+        FFMPEG_EXE,
+        "-y",
+        "-ss", f"{max(0.0, float(at_seconds)):.3f}",
+        "-i", str(src),
+        "-frames:v", "1",
+        "-q:v", "3",
+        str(dst),
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, timeout=30)
+        return True
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or b"").decode(errors="replace")
+        print(f"[thumbnail] ffmpeg failed: {stderr[-300:]}")
+        return False
+    except subprocess.TimeoutExpired:
+        print("[thumbnail] ffmpeg timeout after 30s")
+        return False
 
 
 def _transcode_to_h264(src: Path, dst: Path) -> bool:
@@ -488,6 +530,19 @@ async def videoUpload(
         annotated_video=annotated_dest.name,
     )
 
+    # Auto-snapshot this annotation into the gallery so the user can reload it
+    # later without re-running the CV pipeline. Any failure here is logged but
+    # does NOT fail the upload — the current session is already live.
+    gallery_session_id = None
+    try:
+        gallery_session_id = _snapshot_to_gallery(
+            raw_input=dest,
+            annotated_output=annotated_dest,
+            title=title or (file.filename or filename),
+        )
+    except Exception as e:
+        print(f"[gallery] snapshot failed ({e.__class__.__name__}: {e})")
+
     return {
         "message": "uploaded",
         "title": title,
@@ -496,7 +551,51 @@ async def videoUpload(
         "annotated_filename": annotated_dest.name,
         "shots_stored": shot_count,
         "content_type": file.content_type,
+        "gallery_session_id": gallery_session_id,
     }
+
+
+def _snapshot_to_gallery(
+    *,
+    raw_input: Path,
+    annotated_output: Path,
+    title: str,
+) -> str:
+    """Copy the just-annotated pair into Gallery/<sid>/, extract a thumbnail,
+    and persist a metadata + shots + roster snapshot to Mongo. Returns the
+    session id. Raises on unrecoverable errors; caller catches and logs."""
+    session_id = uuid.uuid4().hex
+    session_dir = GALLERY_DIR / session_id
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    input_copy = session_dir / "input.mp4"
+    output_copy = session_dir / "output.mp4"
+    thumb_copy = session_dir / "thumb.jpg"
+
+    shutil.copy2(raw_input, input_copy)
+    shutil.copy2(annotated_output, output_copy)
+
+    duration = _get_video_duration(output_copy)
+    thumb_at = max(0.5, duration * 0.1)
+    _extract_thumbnail(output_copy, thumb_copy, at_seconds=thumb_at)
+
+    # Pull shots + roster from Mongo as they stand right now — these were just
+    # written by `replace_video_session` above.
+    current_shots = fetch_shots()
+    current_roster = get_roster()
+
+    save_gallery_session(
+        session_id=session_id,
+        title=title.strip() or f"session-{session_id[:8]}",
+        duration_seconds=duration,
+        input_video_relpath=f"{session_id}/input.mp4",
+        annotated_video_relpath=f"{session_id}/output.mp4",
+        thumbnail_relpath=f"{session_id}/thumb.jpg",
+        shots=current_shots,
+        roster=current_roster,
+    )
+    print(f"[gallery] snapshot saved: {session_id} ({title}, {len(current_shots)} shots)")
+    return session_id
 
 
 @app.get("/videoSend/{filename}")
@@ -511,6 +610,142 @@ async def send_video(filename: str):
         path=video_path,
         media_type="video/mp4",
     )
+
+
+# --------------------------------------------------------------------
+# Gallery — persistent archive of past annotated sessions.
+# --------------------------------------------------------------------
+
+
+def _gallery_entry_public(entry: dict) -> dict:
+    """Shape a gallery doc for the frontend: IDs, URLs, meta — no shots array.
+    URLs are server-rooted so the frontend doesn't need to know the filesystem
+    layout; both `thumbnail_url` and `video_url` are absolute-from-origin."""
+    sid = entry.get("_id") or entry.get("session_id")
+    created_at = entry.get("created_at")
+    return {
+        "session_id": sid,
+        "title": entry.get("title") or "",
+        "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else created_at,
+        "duration_seconds": float(entry.get("duration_seconds") or 0),
+        "shot_count": int(entry.get("shot_count") or 0),
+        "thumbnail_url": f"/api/gallery/{sid}/thumbnail",
+        "video_url": f"/api/gallery/{sid}/video",
+    }
+
+
+@app.get("/api/gallery")
+async def gallery_list():
+    entries = list_gallery_sessions()
+    return [_gallery_entry_public(e) for e in entries]
+
+
+class SaveCurrentRequest(BaseModel):
+    title: Optional[str] = None
+
+
+@app.post("/api/gallery/save-current")
+async def gallery_save_current(body: SaveCurrentRequest | None = None):
+    """Snapshot the currently-loaded session (Uploads/input.mp4 + Annotated/
+    output.mp4 + current Mongo shots + roster) into the gallery without
+    re-running the CV pipeline. Use this after an upload that happened before
+    the auto-snapshot logic was in place, or to re-save after editing the
+    roster. Title falls back to the source filename."""
+    annotated = _find_annotated_video()
+    if annotated is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No annotated video loaded — upload a clip first.",
+        )
+
+    # The raw input lives in UPLOAD_DIR with a matching or related filename.
+    # Fall back to any *.mp4 under UPLOAD_DIR; the CV pipeline only keeps one.
+    raw_inputs = sorted(UPLOAD_DIR.glob("*.mp4")) if UPLOAD_DIR.exists() else []
+    raw_input = raw_inputs[0] if raw_inputs else annotated  # copy the annotated twice if no raw
+
+    title = (body.title if body else None) or annotated.stem or "Saved session"
+
+    try:
+        session_id = _snapshot_to_gallery(
+            raw_input=raw_input,
+            annotated_output=annotated,
+            title=title,
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Gallery snapshot failed: {e.__class__.__name__}: {e}",
+        )
+
+    return {"saved": True, "session_id": session_id, "title": title}
+
+
+@app.get("/api/gallery/{session_id}/thumbnail")
+async def gallery_thumbnail(session_id: str):
+    thumb_path = GALLERY_DIR / session_id / "thumb.jpg"
+    if not thumb_path.exists():
+        raise HTTPException(status_code=404, detail="Thumbnail not found")
+    return FileResponse(path=thumb_path, media_type="image/jpeg")
+
+
+@app.get("/api/gallery/{session_id}/video")
+async def gallery_video(session_id: str):
+    video_path = GALLERY_DIR / session_id / "output.mp4"
+    if not video_path.exists():
+        raise HTTPException(status_code=404, detail="Gallery video not found")
+    return FileResponse(path=video_path, media_type="video/mp4")
+
+
+@app.post("/api/gallery/{session_id}/load")
+async def gallery_load(session_id: str):
+    """Restore a saved session as the current one: Mongo state + the single
+    `Uploads/input.mp4` + `Annotated/output.mp4` slots both get replaced with
+    the gallery entry's files. The Film page's existing /api/video/info flow
+    then picks it up like a fresh upload."""
+    entry = load_gallery_session_as_current(session_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Gallery session not found")
+
+    session_dir = GALLERY_DIR / session_id
+    gallery_input = session_dir / "input.mp4"
+    gallery_output = session_dir / "output.mp4"
+    if not gallery_output.exists():
+        raise HTTPException(
+            status_code=410,
+            detail="Gallery video files missing on disk — entry may be stale",
+        )
+
+    # Clear any current file slots before copying so the copy is deterministic
+    # regardless of what extension/name the previous upload used.
+    for folder in (UPLOAD_DIR, ANNOTATED_DIR):
+        if folder.exists():
+            for mp4 in folder.glob("*.mp4"):
+                try:
+                    mp4.unlink()
+                except OSError:
+                    pass
+
+    shutil.copy2(gallery_output, ANNOTATED_DIR / "output.mp4")
+    if gallery_input.exists():
+        shutil.copy2(gallery_input, UPLOAD_DIR / "input.mp4")
+
+    print(f"[gallery] loaded session {session_id} into current slots")
+    return {
+        "loaded": True,
+        "session_id": session_id,
+        "title": entry.get("title") or "",
+    }
+
+
+@app.delete("/api/gallery/{session_id}")
+async def gallery_delete(session_id: str):
+    removed = delete_gallery_session(session_id)
+    session_dir = GALLERY_DIR / session_id
+    if session_dir.exists():
+        shutil.rmtree(session_dir, ignore_errors=True)
+    if not removed:
+        raise HTTPException(status_code=404, detail="Gallery session not found")
+    return {"deleted": True, "session_id": session_id}
 
 
 CHAT_RESPONSE_SCHEMA = {

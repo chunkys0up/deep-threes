@@ -19,7 +19,7 @@ NBA_TEAMS: list[dict] = [
     {"name": "Atlanta Hawks",          "hex": "#E03A3E"},
     {"name": "Boston Celtics",         "hex": "#007A33"},
     {"name": "Brooklyn Nets",          "hex": "#000000"},
-    {"name": "Charlotte Hornets",      "hex": "#1D1160"},
+    {"name": "Charlotte Hornets",      "hex": "#00788C"},
     {"name": "Chicago Bulls",          "hex": "#CE1141"},
     {"name": "Cleveland Cavaliers",    "hex": "#860038"},
     {"name": "Dallas Mavericks",       "hex": "#00538C"},
