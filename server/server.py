@@ -11,19 +11,19 @@ app = FastAPI()
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 ANNOTATED_DIR = Path("Annotated")
-
+ANNOTATED_DIR.mkdir(parents=True, exist_ok=True)
 
 
 
 ALLOWED_EXTENSIONS = {"video/mp4"}
 
-filename = ""
+#filename = ""
 
 # Database connection
 
 
 
-app.get("/")
+@app.get("/")
 async def root():
     return {"message": "Hello World"}
 
@@ -54,7 +54,16 @@ async def videoUpload(
         "content_type": file.content_type,
     }
 
-@app.get("/videoSend")
-async def send_video():
-    videoPath = Annotated / filename
-    return videoPath
+@app.get("/videoSend/{filename}")
+async def send_video(filename: str):
+    video_path = ANNOTATED_DIR / filename
+
+    if not video_path.exists() or not video_path.is_file():
+        raise HTTPException(status_code=404, detail="Video Not Found")
+
+    return FileResponse(
+        path=video_path,
+        media_type="video/mp4",
+        filename=filename,
+    )
+
