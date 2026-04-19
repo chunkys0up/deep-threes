@@ -25,7 +25,10 @@ def coords_above_threshold(
     return pairs
 
 
-def fit_team_classifier(client) -> TeamClassifier:
+def fit_team_classifier(client) -> Tuple[TeamClassifier, List[np.ndarray]]:
+    """Fit the two-cluster jersey classifier and return it alongside the crops
+    it was trained on. The crops are reused downstream to guess which NBA
+    team each cluster corresponds to via color matching."""
     crops = []
 
     for video_path in sv.list_files_with_extensions(SOURCE_VIDEO_DIRECTORY, extensions=["mp4", "avi", "mov"]):
@@ -38,11 +41,27 @@ def fit_team_classifier(client) -> TeamClassifier:
             detections = detections[detections.confidence > PLAYER_DETECTION_MODEL_CONFIDENCE]
             detections = detections[np.isin(detections.class_id, PLAYER_CLASS_IDS)]
 
-            crops += [sv.crop_image(frame, xyxy) for xyxy in detections.xyxy]
+            # Filter out zero-area / empty crops before feeding the team
+            # classifier — cv2.cvtColor raises on empty input and kills the run.
+            for xyxy in detections.xyxy:
+                crop = sv.crop_image(frame, xyxy)
+                if crop is None:
+                    continue
+                if getattr(crop, "size", 0) == 0:
+                    continue
+                if crop.shape[0] < 2 or crop.shape[1] < 2:
+                    continue
+                crops.append(crop)
+
+    if not crops:
+        raise RuntimeError(
+            "Team classifier found no usable player crops — upload may have "
+            "no visible players or detection confidence is too high."
+        )
 
     team_classifier = TeamClassifier(device="cpu")
     team_classifier.fit(crops)
-    return team_classifier
+    return team_classifier, crops
 
 
 def classify_teams(frame: np.ndarray, player_detections: sv.Detections, team_classifier: TeamClassifier) -> sv.Detections:

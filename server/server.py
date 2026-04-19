@@ -5,17 +5,25 @@ from pydantic import BaseModel
 from pathlib import Path
 from typing import Annotated, Optional, Literal
 import os
+import sys
 import json
 import re
 import shutil
 import subprocess
 import imageio_ffmpeg
 
+# Put the project root on sys.path so `basketball_cv` (which lives one level
+# above `server/`) is importable regardless of where uvicorn is launched from.
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
-import basketball_cv.run_model as run_model
-from db import fetch_shots, replace_video_session
+# NOTE: basketball_cv.run_model is imported LAZILY inside /videoUpload so the
+# server can still boot even when Roboflow SDK deps aren't installed yet.
+from db import fetch_shots, replace_video_session, get_roster, save_roster, resolve_player
 
 
 # Load .env BEFORE reading any environment variables.
@@ -46,18 +54,9 @@ ANNOTATED_DIR.mkdir(parents=True, exist_ok=True)
 
 ALLOWED_EXTENSIONS = {"video/mp4"}
 
-# Placeholder events the frontend renders over the timeline until the CV
-# pipeline surfaces real ones.
-DEFAULT_EVENTS = [
-    "Tip-off",
-    "First basket",
-    "Pick and roll — Team 0",
-    "Fast break",
-    "Turnover",
-    "3-point attempt",
-    "Isolation play — Team 1",
-    "Timeout",
-]
+# Distance threshold (feet) used to classify a jump shot as a three-pointer
+# when responding to natural-language queries. Matches what db.py uses.
+_THREE_POINT_DISTANCE_FT = 22.0
 
 
 def _find_annotated_video() -> Optional[Path]:
@@ -140,24 +139,35 @@ def _build_system_instruction(user_query: str = "") -> str:
             base
             + "\n\nThere is no video loaded right now. The events table is empty — always return `highlights: []`."
         )
+
     duration = _get_video_duration(video)
-    all_events = _all_events(duration)
+    shots, all_events = _all_events()
+
+    if not all_events:
+        return (
+            base
+            + f"\n\nA video is loaded ({video.name}, {_fmt_mmss(duration)}) but "
+              "no shots have been extracted yet. The events table is empty — "
+              "always return `highlights: []`."
+        )
+
     filtered_events, original_indices = _filter_events_by_query(
-        all_events, user_query)
+        shots, all_events, user_query
+    )
 
     if not filtered_events:
-        events_block = "  (no events available)"
+        events_block = "  (no events match the query)"
+        scope_note = f"0 of {len(all_events)} events match"
     else:
         events_block = "\n".join(
             f"  [{idx}] {_fmt_mmss(ev['time'])} — {ev['description']}"
             for idx, ev in zip(original_indices, filtered_events)
         )
-
-    scope_note = (
-        "showing all events"
-        if len(filtered_events) == len(all_events)
-        else f"pre-filtered by the user's query — {len(filtered_events)} of {len(all_events)} events shown"
-    )
+        scope_note = (
+            "showing all events"
+            if len(filtered_events) == len(all_events)
+            else f"pre-filtered by the user's query — {len(filtered_events)} of {len(all_events)} events shown"
+        )
 
     return (
         f"{base}\n\n"
@@ -197,92 +207,132 @@ def _transcode_to_h264(src: Path, dst: Path) -> bool:
         return False
 
 
-def _placeholder_timestamps(duration: float) -> list[dict]:
-    # Distribute events evenly inside the actual video duration so every event
-    # position stays inside [0, 100%] for the scrubber — no more half-clipped
-    # thumbnails on the right edge.
-    if duration <= 0:
-        duration = 120.0
-    step = duration / (len(DEFAULT_EVENTS) + 1)
-    return [
-        {
-            "time": round((i + 1) * step, 2),
-            "description": DEFAULT_EVENTS[i],
-            "thumbnail": f"https://picsum.photos/seed/{i + 1}/120/68",
-        }
-        for i in range(len(DEFAULT_EVENTS))
-    ]
+def _shot_to_event(shot: dict, index: int, roster: dict | None = None) -> dict:
+    """Translate a Mongo shot doc into the {time, description, thumbnail}
+    shape the frontend seekbar + thumbnails strip consumes.
+    Applies roster overrides so custom team/player names flow through."""
+    shot_type = shot.get("shot_type") or ""
+    distance = float(shot.get("distance_feet") or 0)
+    made = bool(shot.get("made"))
+    team_detected = (shot.get("team_name") or "").strip()
+    jersey = shot.get("player_number")
+    timestamp = float(shot.get("timestamp_seconds") or 0)
+
+    # Roster lookup — falls back to detected values if no override is set.
+    team_override, player_override = resolve_player(team_detected, jersey, roster)
+    team_display = team_override or team_detected
+    player_display = player_override or (
+        (shot.get("player_name") or "").strip() or None
+    )
+
+    if shot_type == "layup_dunk":
+        type_label = "Layup/dunk"
+    elif shot_type == "jump_shot":
+        if distance >= _THREE_POINT_DISTANCE_FT:
+            type_label = f"3PT jumper ({distance:.1f} ft)"
+        else:
+            type_label = f"Jumper ({distance:.1f} ft)"
+    else:
+        type_label = "Shot"
+
+    parts = [type_label, "made" if made else "missed"]
+    if team_display:
+        parts.append(f"— {team_display}")
+    if player_display:
+        parts.append(player_display)
+    elif jersey is not None:
+        parts.append(f"#{jersey}")
+
+    return {
+        "time": round(timestamp, 2),
+        "description": " ".join(parts),
+        "thumbnail": f"https://picsum.photos/seed/shot{index}/120/68",
+    }
 
 
-def _all_events(duration: float) -> list[dict]:
-    """Full event list for the currently loaded video.
+def _all_events() -> tuple[list[dict], list[dict]]:
+    """Current video's events, sourced exclusively from Mongo.
+    Returns (raw_shots, events) where `events` is the frontend-facing shape
+    and `raw_shots` are kept for keyword filtering. Empty lists when the CV
+    pipeline hasn't populated the collection yet."""
+    shots = fetch_shots()
+    roster = get_roster()
+    events = [_shot_to_event(s, i + 1, roster=roster) for i, s in enumerate(shots)]
+    return shots, events
 
-    Preference order:
-      1. Mongo `shots` collection — when the CV pipeline has written data
-      2. Placeholder events — so the demo works before real CV output lands
-    """
-    shots = query_shots()
-    if shots:
-        return [shot_to_event(s, seed=i + 1) for i, s in enumerate(shots)]
-    return _placeholder_timestamps(duration)
+
+_THREE_POINT_KEYWORDS = (
+    "three pointer",
+    "three-pointer",
+    "three point",
+    "three-point",
+    "3 pointer",
+    "3-pointer",
+    "3-point",
+    "3pt",
+    "from downtown",
+    "beyond the arc",
+    "from deep",
+)
+_MADE_KEYWORDS = ("made", "makes", "scored", "converted", "bucket")
+_MISSED_KEYWORDS = ("missed", "miss ", " miss", "bricked", "airball")
 
 
 def _filter_events_by_query(
-    events: list[dict], user_query: str
+    shots: list[dict], events: list[dict], user_query: str
 ) -> tuple[list[dict], list[int]]:
-    """Keyword-filter an event list against the user's natural-language query.
-
-    Returns `(filtered_events, original_indices)` where:
-      - filtered_events are the events that matched (preserving order)
-      - original_indices[i] = index of filtered_events[i] in the full `events`
-        list. This is what gets surfaced to Gemini so the highlights it emits
-        still line up with the frontend's seekbar.
-
-    Implementation note: the real keyword→Mongo translation lives in
-    `db.extract_shot_filter`; this function re-queries Mongo with that filter
-    and maps results back to their position in the full list by timestamp.
-    If Mongo is empty (placeholder mode), we substring-match the description.
-    """
-    if not user_query:
+    """Python-side keyword filter over Mongo shot docs. Returns
+    (filtered_events, original_indices) so Gemini's highlights still line up
+    with VideoPlayer's full-shot index space."""
+    if not user_query or not events:
         return events, list(range(len(events)))
 
-    mongo_filter = extract_shot_filter(user_query)
-    if not mongo_filter:
-        # No keywords matched → no filter, Gemini sees everything.
+    q = user_query.lower()
+    filters: list = []
+
+    if "layup" in q or "dunk" in q or "at the rim" in q:
+        filters.append(lambda s: s.get("shot_type") == "layup_dunk")
+    elif "jumper" in q or "jump shot" in q:
+        filters.append(lambda s: s.get("shot_type") == "jump_shot")
+
+    if any(k in q for k in _THREE_POINT_KEYWORDS):
+        filters.append(
+            lambda s: float(s.get("distance_feet") or 0) >= _THREE_POINT_DISTANCE_FT
+        )
+
+    if any(k in q for k in _MISSED_KEYWORDS):
+        filters.append(lambda s: not bool(s.get("made")))
+    elif any(k in q for k in _MADE_KEYWORDS):
+        filters.append(lambda s: bool(s.get("made")))
+
+    if "celtic" in q or "boston" in q:
+        filters.append(
+            lambda s: "celtic" in (s.get("team_name") or "").lower()
+        )
+    if "knick" in q or "new york" in q or "nyk" in q:
+        filters.append(
+            lambda s: "knick" in (s.get("team_name") or "").lower()
+        )
+
+    m = re.search(r"(?:#|\bnumber\b|\bjersey\b)\s*(\d{1,2})", q)
+    if m:
+        try:
+            target = int(m.group(1))
+            filters.append(lambda s: s.get("player_number") == target)
+        except ValueError:
+            pass
+
+    if not filters:
         return events, list(range(len(events)))
 
-    # Try Mongo-side filter first so we actually hit the shots collection.
-    matched_shots = query_shots(mongo_filter)
-    if matched_shots:
-        # Align matches back onto the full events list by timestamp so the
-        # indices we hand to the frontend are indices into VideoPlayer's
-        # timestamps state (which was built from ALL shots).
-        match_times = {round(float(s.get("timestamp") or 0), 2)
-                       for s in matched_shots}
-        filtered_events = []
-        original_indices = []
-        for idx, ev in enumerate(events):
-            if round(ev["time"], 2) in match_times:
-                filtered_events.append(ev)
-                original_indices.append(idx)
-        if filtered_events:
-            return filtered_events, original_indices
-
-    # Fallback path — no Mongo data, so keyword-match the description text.
-    q_lower = user_query.lower()
-    tokens = [t for t in q_lower.replace("-", " ").split() if len(t) > 2]
-    filtered_events = []
-    original_indices = []
-    for idx, ev in enumerate(events):
-        desc = ev["description"].lower()
-        if any(t in desc for t in tokens):
+    filtered_events: list[dict] = []
+    original_indices: list[int] = []
+    for idx, (shot, ev) in enumerate(zip(shots, events)):
+        if all(f(shot) for f in filters):
             filtered_events.append(ev)
             original_indices.append(idx)
-    if filtered_events:
-        return filtered_events, original_indices
 
-    # Nothing matched — hand back everything; Gemini can say so.
-    return events, list(range(len(events)))
+    return filtered_events, original_indices
 
 
 @app.get("/")
@@ -300,6 +350,7 @@ async def video_info():
         return {"hasVideo": False}
 
     duration = _get_video_duration(video)
+    _shots, events = _all_events()
     return {
         "hasVideo": True,
         "metadata": {
@@ -307,15 +358,15 @@ async def video_info():
             "title": video.name,
             "url": f"http://localhost:8000/videoSend/{video.name}",
         },
-        # Mongo-first; placeholder when the shots collection is empty so the
-        # demo still has something to render before the CV pipeline wires in.
-        "timestamps": _all_events(duration),
+        # Mongo-only — empty list until the CV pipeline writes real shots.
+        "timestamps": events,
     }
 
 
 @app.get("/api/video/timestamps")
-async def video_timestamps(duration: float):
-    return _placeholder_timestamps(duration)
+async def video_timestamps(duration: float | None = None):
+    _shots, events = _all_events()
+    return events
 
 
 @app.get("/api/shots")
@@ -323,11 +374,51 @@ async def get_shots():
     return fetch_shots()
 
 
+@app.get("/api/players")
+async def players():
+    """Distinct (team, jersey_number) pairs from the current shots collection
+    plus the saved roster overrides so the editor can hydrate with both the
+    detected data and any user edits."""
+    shots = fetch_shots()
+    by_team: dict[str, set[int]] = {}
+    for s in shots:
+        team = (s.get("team_name") or "").strip()
+        jersey = s.get("player_number")
+        if not team or jersey is None:
+            continue
+        try:
+            by_team.setdefault(team, set()).add(int(jersey))
+        except (TypeError, ValueError):
+            continue
+
+    teams = [
+        {"team_color": team, "jerseys": sorted(js)}
+        for team, js in sorted(by_team.items())
+    ]
+    return {"teams": teams, "roster": get_roster()}
+
+
+class RosterRequest(BaseModel):
+    teams: dict[str, dict] = {}
+
+
+@app.get("/api/roster")
+async def roster_get():
+    return get_roster()
+
+
+@app.put("/api/roster")
+async def roster_put(body: RosterRequest):
+    save_roster(body.model_dump())
+    return get_roster()
+
+
 @app.post("/videoUpload")
 async def videoUpload(
     file: Annotated[UploadFile, File(...)],
     title: Annotated[str | None, Form()] = None,
-
+    team_0_name: Annotated[str | None, Form()] = None,
+    team_1_name: Annotated[str | None, Form()] = None,
 ):
     if file.content_type not in ALLOWED_EXTENSIONS:
         raise HTTPException(status_code=415, detail="Unsupported Media Type")
@@ -349,7 +440,48 @@ async def videoUpload(
 
     await file.close()
 
-    shots = run_model.run_model(str(dest), str(annotated_dest))
+    # Lazy import — the Roboflow/torch dependency chain is heavy and optional
+    # for everything except the upload path.
+    try:
+        import basketball_cv.run_model as run_model
+    except ImportError as e:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "CV pipeline dependencies not installed. "
+                f"Run `pip install -r requirements.txt` in the venv. ({e})"
+            ),
+        )
+
+    # User-provided team names (from the upload backboard). Blank → None so
+    # run_model falls back to the config defaults.
+    team_names_override: dict[int, str] = {}
+    if team_0_name and team_0_name.strip():
+        team_names_override[0] = team_0_name.strip()
+    if team_1_name and team_1_name.strip():
+        team_names_override[1] = team_1_name.strip()
+
+    shots = run_model.run_model(
+        str(dest), str(annotated_dest),
+        team_names=team_names_override or None,
+    )
+
+    # OpenCV's VideoWriter (used inside run_model) writes FMP4 / MPEG-4 Part 2
+    # by default, which browsers can't decode. Re-encode the annotated output
+    # in place to H.264/AAC so <video> plays it. Does a tmp-file swap so the
+    # original annotated file isn't corrupted if ffmpeg fails.
+    tmp_dest = annotated_dest.with_suffix(annotated_dest.suffix + ".h264.tmp.mp4")
+    if _transcode_to_h264(annotated_dest, tmp_dest):
+        annotated_dest.unlink()
+        tmp_dest.rename(annotated_dest)
+        print(f"[transcode] annotated video re-encoded to H.264: {annotated_dest.name}")
+    else:
+        # Leave the raw FMP4 output — browser will show the codec-error overlay
+        # but at least the shots data is still good.
+        if tmp_dest.exists():
+            tmp_dest.unlink()
+        print("[transcode] ffmpeg step failed, leaving raw annotated output as-is")
+
     shot_count = replace_video_session(
         shots,
         source_video=dest.name,

@@ -14,6 +14,7 @@ from .jersey_number_team_detection import (
     recognize_jersey_numbers,
     init_number_validator,
 )
+from .team_identification import identify_nba_teams
 from .annotate import (
     euclidean_distance,
     extract_xy,
@@ -41,12 +42,30 @@ def get_shot_category(distance: float) -> str:
     return "Paint"
 
 
-def run_model(source_video_path: str, target_video_path: str) -> List[Shot]:
+def run_model(
+    source_video_path: str,
+    target_video_path: str,
+    team_names: dict | None = None,
+) -> List[Shot]:
+    # Per-run team name overrides. Priority:
+    #   1. Explicit `team_names` arg from the caller (user override).
+    #   2. NBA team auto-detected from the fitted classifier's jersey colors.
+    #   3. Generic "Team 0" / "Team 1" from config as a last resort.
+    # The jersey editor on the frontend lets the user correct auto-detection
+    # after annotation, so a wrong guess here is non-fatal.
+    caller_overrides = dict(team_names) if team_names else {}
+
     source = Path(source_video_path)
     target = Path(target_video_path)
 
     video_info = sv.VideoInfo.from_video_path(str(source))
-    team_classifier = fit_team_classifier(CLIENT)
+    team_classifier, fit_crops = fit_team_classifier(CLIENT)
+
+    detected_team_names = identify_nba_teams(
+        team_classifier, fit_crops, fallback=TEAM_NAMES
+    )
+    team_names = {**TEAM_NAMES, **detected_team_names, **caller_overrides}
+    print(f"[run_model] team_names resolved to: {team_names}")
     byte_tracker = sv.ByteTrack(frame_rate=30)
     number_validator = init_number_validator()
     shot_event_tracker = ShotEventTracker(
@@ -196,7 +215,7 @@ def run_model(source_video_path: str, target_video_path: str) -> List[Shot]:
 
                     if len(shot_player_info) > 0:
                         shot_player_team_id = int(shot_player_info.data["team_id"][0])
-                        shot_player_team_name = TEAM_NAMES.get(shot_player_team_id, "Unknown")
+                        shot_player_team_name = team_names.get(shot_player_team_id, "Unknown")
                         validated_numbers = number_validator.get_validated(
                             tracker_ids=[player_tracker_id_for_shot]
                         )
@@ -239,7 +258,7 @@ def run_model(source_video_path: str, target_video_path: str) -> List[Shot]:
             player_labels = []
             for i, num in enumerate(validated_numbers):
                 team_id = int(player_detections.data["team_id"][i])
-                team_name = TEAM_NAMES.get(team_id, "Unknown")
+                team_name = team_names.get(team_id, "Unknown")
                 display_num = f"#{num}" if num not in (None, "") else ""
                 player_labels.append(f"{display_num} {team_name}".strip())
 

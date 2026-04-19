@@ -414,6 +414,9 @@ export default function VideoPlayer({
               <p className="text-[#7a89a8] text-sm">
                 MP4 files only · click to browse
               </p>
+              <p className="text-[#7a89a8] text-[11px] -mt-1">
+                Label teams and players after annotation in the jersey editor
+              </p>
             </>
           )}
           <input
