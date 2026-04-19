@@ -33,7 +33,12 @@ function HoopIcon({ className }) {
   );
 }
 
-export default function VideoPlayer({ isTheaterMode = false, onTheaterToggle }) {
+export default function VideoPlayer({
+  isTheaterMode = false,
+  onTheaterToggle,
+  highlightFilter = null,
+  onTimestampsChange,
+}) {
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -98,11 +103,13 @@ export default function VideoPlayer({ isTheaterMode = false, onTheaterToggle }) 
         setVideoUrl("");
         setTimestamps([]);
         setDuration(0);
+        onTimestampsChange?.([], null);
       } else {
         setHasVideo(true);
         setTimestamps(data.timestamps);
         setDuration(data.metadata.duration);
         setVideoUrl(data.metadata.url);
+        onTimestampsChange?.(data.timestamps, data.metadata.url);
       }
       setLoading(false);
     } catch (err) {
@@ -185,6 +192,7 @@ export default function VideoPlayer({ isTheaterMode = false, onTheaterToggle }) 
       if (response.ok) {
         const newTimestamps = await response.json();
         setTimestamps(newTimestamps);
+        onTimestampsChange?.(newTimestamps, videoUrl);
       }
     } catch (err) {
       console.error("Failed to fetch timestamps:", err);
@@ -507,6 +515,7 @@ export default function VideoPlayer({ isTheaterMode = false, onTheaterToggle }) 
           >
             <div className="relative w-full h-full">
               {timestamps.map((timestamp, index) => {
+                if (highlightFilter && !highlightFilter.includes(index)) return null;
                 if (!isTimestampVisible(timestamp.time)) return null;
 
                 const position = getTimestampPosition(timestamp.time);
@@ -582,6 +591,7 @@ export default function VideoPlayer({ isTheaterMode = false, onTheaterToggle }) 
                   </div>
 
                   {timestamps.map((timestamp, index) => {
+                    if (highlightFilter && !highlightFilter.includes(index)) return null;
                     const position = getTimestampPosition(timestamp.time);
                     const isVisible = isTimestampVisible(timestamp.time);
                     const opacity = getTimestampOpacity(timestamp.time);
