@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import supervision as sv
@@ -30,15 +30,24 @@ from sports.basketball import ShotEventTracker
 CLIENT = loadClient()
 
 
+SHOT_DISPLAY_DURATION_SECONDS = 2.0
+
+
+def get_shot_category(distance: float) -> str:
+    if distance >= 23.75:
+        return "3PT"
+    if distance >= 10.0:
+        return "Midrange"
+    return "Paint"
+
+
 def run_model(source_video_path: str, target_video_path: str) -> List[Shot]:
     source = Path(source_video_path)
     target = Path(target_video_path)
 
     video_info = sv.VideoInfo.from_video_path(str(source))
-
     team_classifier = fit_team_classifier(CLIENT)
-
-    byte_tracker = sv.ByteTrack(frame_rate=video_info.fps)
+    byte_tracker = sv.ByteTrack(frame_rate=30)
     number_validator = init_number_validator()
     shot_event_tracker = ShotEventTracker(
         reset_time_frames=int(video_info.fps * 1.7),
@@ -47,8 +56,8 @@ def run_model(source_video_path: str, target_video_path: str) -> List[Shot]:
     )
     smoother = KeyPointsSmoother(length=3)
 
-    LEFT_BASKET = CONFIG.vertices[CONFIG.left_basket_index]
-    RIGHT_BASKET = CONFIG.vertices[CONFIG.right_basket_index]
+    LEFT_BASKET_COURT_COORDS = CONFIG.vertices[CONFIG.left_basket_index]
+    RIGHT_BASKET_COURT_COORDS = CONFIG.vertices[CONFIG.right_basket_index]
 
     team_0_annotator = sv.RichLabelAnnotator(
         font_size=20, color=get_team_color_by_id(0), text_color=sv.Color.BLACK,
@@ -60,16 +69,34 @@ def run_model(source_video_path: str, target_video_path: str) -> List[Shot]:
     )
 
     shots: List[Shot] = []
-    shot_state = {"xy": None, "tracker_id": None}
-    image_to_court = None
-    court_to_image = None
+    shot_in_progress_xy: Optional[np.ndarray] = None
+    player_tracker_id_for_shot: Optional[int] = None
 
     def callback(frame: np.ndarray, index: int) -> np.ndarray:
-        nonlocal image_to_court, court_to_image
+        nonlocal shots, shot_in_progress_xy, player_tracker_id_for_shot
+
+        current_time_seconds = index / video_info.fps
 
         # 1. Player detection + tracking
         result_players = CLIENT.infer(frame, model_id=PLAYER_DETECTION_MODEL_ID)
-        player_detections = sv.Detections.from_inference(result_players)
+        initial_player_detections = sv.Detections.from_inference(result_players)
+        has_jump_shot = len(
+            initial_player_detections[
+                initial_player_detections.class_id == JUMP_SHOT_CLASS_ID
+            ]
+        ) > 0
+        has_layup_dunk = len(
+            initial_player_detections[
+                initial_player_detections.class_id == LAYUP_DUNK_CLASS_ID
+            ]
+        ) > 0
+        has_ball_in_basket = len(
+            initial_player_detections[
+                initial_player_detections.class_id == BALL_IN_BASKET_CLASS_ID
+            ]
+        ) > 0
+
+        player_detections = initial_player_detections
         player_detections = player_detections.with_nms(
             threshold=PLAYER_DETECTION_MODEL_IOU_THRESHOLD, class_agnostic=True
         )
@@ -85,7 +112,12 @@ def run_model(source_video_path: str, target_video_path: str) -> List[Shot]:
         )
 
         # 2. Team classification
-        player_detections = classify_teams(frame, player_detections, team_classifier)
+        if len(player_detections) > 0:
+            player_crops = [sv.crop_image(frame, xyxy) for xyxy in player_detections.xyxy]
+            current_frame_teams = team_classifier.predict(player_crops)
+            player_detections.data["team_id"] = current_frame_teams
+        else:
+            player_detections.data["team_id"] = np.array([])
 
         # 3. Jersey number recognition every 5 frames
         if index % 5 == 0:
@@ -101,6 +133,8 @@ def run_model(source_video_path: str, target_video_path: str) -> List[Shot]:
         key_mask = key_points.confidence[0] > KEYPOINT_CONFIDENCE_THRESHOLD
         have_enough_points = np.count_nonzero(key_mask) >= 4
 
+        image_to_court = None
+        court_to_image = None
         if have_enough_points:
             court_vertices_masked = np.array(CONFIG.vertices)[key_mask]
             detected_on_image = key_points[:, key_mask].xy[0]
@@ -108,10 +142,6 @@ def run_model(source_video_path: str, target_video_path: str) -> List[Shot]:
             court_to_image = ViewTransformer(source=court_vertices_masked, target=detected_on_image)
 
         # 5. Shot event tracking
-        has_jump_shot = len(player_detections[player_detections.class_id == JUMP_SHOT_CLASS_ID]) > 0
-        has_layup_dunk = len(player_detections[player_detections.class_id == LAYUP_DUNK_CLASS_ID]) > 0
-        has_ball_in_basket = len(player_detections[player_detections.class_id == BALL_IN_BASKET_CLASS_ID]) > 0
-
         events = shot_event_tracker.update(
             frame_index=index,
             has_jump_shot=has_jump_shot,
@@ -134,48 +164,70 @@ def run_model(source_video_path: str, target_video_path: str) -> List[Shot]:
                 )
                 if len(anchors_image) > 0:
                     anchors_court = image_to_court.transform_points(points=anchors_image)
-                    shot_state["xy"] = anchors_court[0]
-                    shot_state["tracker_id"] = (
-                        shot_player_detections.tracker_id[0]
-                        if len(shot_player_detections.tracker_id) > 0
-                        else None
+                    shot_in_progress_xy = anchors_court[0]
+                    if len(shot_player_detections.tracker_id) > 0:
+                        player_tracker_id_for_shot = int(shot_player_detections.tracker_id[0])
+                    else:
+                        player_tracker_id_for_shot = None
+
+            for result, event_list in ((True, made_events), (False, missed_events)):
+                if event_list and shot_in_progress_xy is not None and player_tracker_id_for_shot is not None:
+                    distance_to_left = euclidean_distance(
+                        shot_in_progress_xy,
+                        LEFT_BASKET_COURT_COORDS,
+                    )
+                    distance_to_right = euclidean_distance(
+                        shot_in_progress_xy,
+                        RIGHT_BASKET_COURT_COORDS,
                     )
 
-            for result, event_list in [(True, made_events), (False, missed_events)]:
-                if event_list and shot_state["xy"] is not None and shot_state["tracker_id"] is not None:
-                    pos = shot_state["xy"]
-                    target_basket = (
-                        LEFT_BASKET
-                        if euclidean_distance(pos, LEFT_BASKET) < euclidean_distance(pos, RIGHT_BASKET)
-                        else RIGHT_BASKET
+                    if distance_to_left < distance_to_right:
+                        target_basket_coords = LEFT_BASKET_COURT_COORDS
+                    else:
+                        target_basket_coords = RIGHT_BASKET_COURT_COORDS
+
+                    shot_type = event_list[0].get("type", "")
+                    shot_player_info = player_detections[
+                        player_detections.tracker_id == player_tracker_id_for_shot
+                    ]
+                    shot_player_team_id = 0
+                    shot_player_team_name = "Unknown"
+                    shot_player_jersey_number = None
+
+                    if len(shot_player_info) > 0:
+                        shot_player_team_id = int(shot_player_info.data["team_id"][0])
+                        shot_player_team_name = TEAM_NAMES.get(shot_player_team_id, "Unknown")
+                        validated_numbers = number_validator.get_validated(
+                            tracker_ids=[player_tracker_id_for_shot]
+                        )
+                        if validated_numbers and validated_numbers[0] not in (None, ""):
+                            try:
+                                shot_player_jersey_number = int(validated_numbers[0])
+                            except (ValueError, TypeError):
+                                pass
+
+                    current_shot_distance = euclidean_distance(
+                        start_point=shot_in_progress_xy,
+                        end_point=target_basket_coords,
                     )
+                    shot_category = get_shot_category(current_shot_distance)
 
-                    tid = shot_state["tracker_id"]
-                    shot_player_info = player_detections[player_detections.tracker_id == tid]
-                    team_id = int(shot_player_info.data["team_id"][0]) if len(shot_player_info) > 0 else 0
-                    team_name = TEAM_NAMES.get(team_id, "Unknown")
-
-                    validated = number_validator.get_validated(tracker_ids=[tid])
-                    jersey_number = None
-                    if validated and validated[0] not in (None, ""):
-                        try:
-                            jersey_number = int(validated[0])
-                        except (ValueError, TypeError):
-                            pass
-
-                    shots.append(Shot(
-                        x=float(pos[0]),
-                        y=float(pos[1]),
-                        distance=euclidean_distance(pos, target_basket),
-                        result=result,
-                        team=team_id,
-                        timestamp=index / video_info.fps,
-                        team_color=team_name,
-                        jersey_number=jersey_number,
-                        shot_type=event_list[0].get("type", ""),
-                    ))
-                    shot_state["xy"] = None
-                    shot_state["tracker_id"] = None
+                    shots.append(
+                        Shot(
+                            x=float(shot_in_progress_xy[0]),
+                            y=float(shot_in_progress_xy[1]),
+                            distance=current_shot_distance,
+                            result=result,
+                            team=shot_player_team_id,
+                            timestamp=current_time_seconds,
+                            team_color=shot_player_team_name,
+                            jersey_number=shot_player_jersey_number,
+                            shot_type=shot_type,
+                            shot_category=shot_category,
+                        )
+                    )
+                    shot_in_progress_xy = None
+                    player_tracker_id_for_shot = None
 
         # 6. Annotation
         annotated_frame = frame.copy()
@@ -199,9 +251,15 @@ def run_model(source_video_path: str, target_video_path: str) -> List[Shot]:
             annotated_frame = team_0_annotator.annotate(scene=annotated_frame, detections=team_0_detections, labels=team_0_labels)
             annotated_frame = team_1_annotator.annotate(scene=annotated_frame, detections=team_1_detections, labels=team_1_labels)
 
-        if have_enough_points and court_to_image is not None and len(shots) > 0:
-            made_shots = [s for s in shots if s.result]
-            missed_shots = [s for s in shots if not s.result]
+        display_shots = [
+            shot
+            for shot in shots
+            if 0 <= (current_time_seconds - shot.timestamp) <= SHOT_DISPLAY_DURATION_SECONDS
+        ]
+
+        if have_enough_points and court_to_image is not None and len(display_shots) > 0:
+            made_shots = [s for s in display_shots if s.result]
+            missed_shots = [s for s in display_shots if not s.result]
 
             if len(made_shots) > 0:
                 made_xy_image = court_to_image.transform_points(points=extract_xy(made_shots))
@@ -209,7 +267,7 @@ def run_model(source_video_path: str, target_video_path: str) -> List[Shot]:
                     xyxy=sv.pad_boxes(np.hstack((made_xy_image, made_xy_image)), px=1, py=1),
                     class_id=extract_class_id(made_shots),
                 )
-                labels_made = [f"{int(s.distance)} feet" for s in made_shots]
+                labels_made = [f"{int(s.distance)} ft ({s.shot_category})" for s in made_shots]
                 annotated_frame = triangle_annotator.annotate(scene=annotated_frame, detections=det_made)
                 annotated_frame = text_annotator.annotate(scene=annotated_frame, detections=det_made, labels=labels_made)
 
@@ -219,7 +277,7 @@ def run_model(source_video_path: str, target_video_path: str) -> List[Shot]:
                     xyxy=sv.pad_boxes(np.hstack((missed_xy_image, missed_xy_image)), px=1, py=1),
                     class_id=extract_class_id(missed_shots),
                 )
-                labels_missed = ["missed"] * len(missed_shots)
+                labels_missed = [f"MISSED ({s.shot_category})" for s in missed_shots]
                 annotated_frame = triangle_annotator_missed.annotate(scene=annotated_frame, detections=det_missed)
                 annotated_frame = text_annotator_missed.annotate(scene=annotated_frame, detections=det_missed, labels=labels_missed)
 
