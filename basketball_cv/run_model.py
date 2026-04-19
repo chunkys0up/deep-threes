@@ -4,7 +4,7 @@ from typing import List, Optional
 import numpy as np
 import supervision as sv
 
-from .roboflow_client import loadClient
+from .roboflow_client import loadClient, infer_with_retry
 from .config import *
 from .Shot import Shot
 from .KeyPointsSmoother import KeyPointsSmoother
@@ -14,12 +14,12 @@ from .jersey_number_team_detection import (
     recognize_jersey_numbers,
     init_number_validator,
 )
+from .team_identification import identify_nba_teams
+from .nba_teams import NBA_TEAMS
 from .annotate import (
     euclidean_distance,
     extract_xy,
     extract_class_id,
-    triangle_annotator,
-    text_annotator,
     triangle_annotator_missed,
     text_annotator_missed,
 )
@@ -41,7 +41,19 @@ def get_shot_category(distance: float) -> str:
     return "Paint"
 
 
-def run_model(source_video_path: str, target_video_path: str) -> List[Shot]:
+def run_model(
+    source_video_path: str,
+    target_video_path: str,
+    team_names: dict | None = None,
+) -> List[Shot]:
+    # Per-run team name overrides. Priority:
+    #   1. Explicit `team_names` arg from the caller (user override).
+    #   2. NBA team auto-detected from the fitted classifier's jersey colors.
+    #   3. Generic "Team 0" / "Team 1" from config as a last resort.
+    # The jersey editor on the frontend lets the user correct auto-detection
+    # after annotation, so a wrong guess here is non-fatal.
+    caller_overrides = dict(team_names) if team_names else {}
+
     source = Path(source_video_path)
     target = Path(target_video_path)
 
@@ -78,7 +90,12 @@ def run_model(source_video_path: str, target_video_path: str) -> List[Shot]:
         current_time_seconds = index / video_info.fps
 
         # 1. Player detection + tracking
-        result_players = CLIENT.infer(frame, model_id=PLAYER_DETECTION_MODEL_ID)
+        result_players = infer_with_retry(CLIENT, frame, PLAYER_DETECTION_MODEL_ID)
+        if result_players is None:
+            # Roboflow upstream failure after retries — skip this frame entirely.
+            # We still return the raw frame so the output video doesn't have a gap.
+            print(f"[callback] frame {index}: player inference failed; skipping")
+            return frame.copy()
         initial_player_detections = sv.Detections.from_inference(result_players)
         has_jump_shot = len(
             initial_player_detections[
@@ -240,7 +257,7 @@ def run_model(source_video_path: str, target_video_path: str) -> List[Shot]:
 
                     if len(shot_player_info) > 0:
                         shot_player_team_id = int(shot_player_info.data["team_id"][0])
-                        shot_player_team_name = TEAM_NAMES.get(shot_player_team_id, "Unknown")
+                        shot_player_team_name = team_names.get(shot_player_team_id, "Unknown")
                         validated_numbers = number_validator.get_validated(
                             tracker_ids=[player_tracker_id_for_shot]
                         )
@@ -353,6 +370,30 @@ def run_model(source_video_path: str, target_video_path: str) -> List[Shot]:
     return shots
 
 
+def _persist_shots_to_mongo(shots: List[Shot]) -> None:
+    """Push the run's shots into deep_threes.shots so the web app can read them.
+    Silent no-op if Mongo isn't reachable — the pipeline shouldn't break just
+    because the DB isn't running."""
+    from dataclasses import asdict
+    try:
+        import pymongo
+    except ImportError:
+        print("[db] pymongo not installed; skipping Mongo write")
+        return
+    try:
+        client = pymongo.MongoClient(
+            "mongodb://localhost:27017/", serverSelectionTimeoutMS=2000
+        )
+        coll = client["deep_threes"]["shots"]
+        # Fresh roster per run — drop this delete if you want append-only history.
+        coll.delete_many({})
+        if shots:
+            coll.insert_many([asdict(s) for s in shots])
+        print(f"[db] Wrote {len(shots)} shots → deep_threes.shots")
+    except Exception as e:
+        print(f"[db] Mongo write skipped ({e.__class__.__name__}: {e})")
+
+
 if __name__ == "__main__":
     import sys
 
@@ -365,3 +406,5 @@ if __name__ == "__main__":
     shots = run_model(source_video_path=source, target_video_path=target)
     for shot in shots:
         print(shot)
+
+    _persist_shots_to_mongo(shots)

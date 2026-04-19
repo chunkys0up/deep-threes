@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import List, Tuple
 
 from sports import ConsecutiveValueTracker, TeamClassifier
+from .roboflow_client import infer_with_retry
 from .config import (
     PLAYER_DETECTION_MODEL_ID,
     NUMBER_RECOGNITION_MODEL_ID,
@@ -69,7 +70,7 @@ def fit_team_classifier(client, source_video_path: str | Path | None = None) -> 
 
     team_classifier = TeamClassifier(device="cpu")
     team_classifier.fit(crops)
-    return team_classifier
+    return team_classifier, crops
 
 
 def classify_teams(frame: np.ndarray, player_detections: sv.Detections, team_classifier: TeamClassifier) -> sv.Detections:
@@ -89,7 +90,11 @@ def recognize_jersey_numbers(
 ) -> ConsecutiveValueTracker:
     frame_h, frame_w, *_ = frame.shape
 
-    result_numbers = client.infer(frame, model_id=PLAYER_DETECTION_MODEL_ID)
+    result_numbers = infer_with_retry(client, frame, PLAYER_DETECTION_MODEL_ID)
+    if result_numbers is None:
+        # Missing one OCR frame just means jersey numbers stay uncorroborated
+        # for a bit longer — the ConsecutiveValueTracker handles that fine.
+        return number_validator
     number_detections = sv.Detections.from_inference(result_numbers)
     number_detections = number_detections[number_detections.class_id == NUMBER_CLASS_ID]
     number_detections.mask = sv.xyxy_to_mask(
@@ -103,8 +108,16 @@ def recognize_jersey_numbers(
 
     numbers_recognized = []
     for number_crop in number_crops:
-        jersey_number_result = client.infer(number_crop, model_id=NUMBER_RECOGNITION_MODEL_ID)
-        numbers_recognized.append(jersey_number_result["response"][">"])
+        jersey_number_result = infer_with_retry(
+            client, number_crop, NUMBER_RECOGNITION_MODEL_ID
+        )
+        if jersey_number_result is None:
+            numbers_recognized.append(None)
+            continue
+        try:
+            numbers_recognized.append(jersey_number_result["response"][">"])
+        except (KeyError, TypeError):
+            numbers_recognized.append(None)
 
     if len(player_detections) > 0 and len(number_detections) > 0:
         iou = sv.mask_iou_batch(

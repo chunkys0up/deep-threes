@@ -57,15 +57,17 @@ court_base = draw_court(
 TEXT_COLOR = sv.Color.from_hex("#FFFFFF")
 MAKE_MISS_COLOR = sv.ColorPalette.from_hex(["#007A33", "#006BB6"])
 
-# Team names and colors — edit here to change teams
+# Generic defaults — the real team names come in per-upload from the frontend
+# ("Home team" / "Away team" inputs on the upload backboard) and override
+# these at run-time via `run_model(..., team_names={0: "Warriors", 1: "Suns"})`.
 TEAM_NAMES = {
-    0: "Boston Celtics",
-    1: "New York Knicks",
+    0: "Team 0",
+    1: "Team 1",
 }
 
 TEAM_COLORS = {
-    "Boston Celtics": "#FFFFFF",
-    "New York Knicks": "#0000FF",
+    "Team 0": "#FFFFFF",
+    "Team 1": "#0000FF",
 }
 
 

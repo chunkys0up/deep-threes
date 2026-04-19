@@ -5,17 +5,37 @@ from pydantic import BaseModel
 from pathlib import Path
 from typing import Annotated, Optional, Literal
 import os
+import sys
 import json
 import re
 import shutil
 import subprocess
+import uuid
 import imageio_ffmpeg
+
+# Put the project root on sys.path so `basketball_cv` (which lives one level
+# above `server/`) is importable regardless of where uvicorn is launched from.
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
-import basketball_cv.run_model as run_model
-from db import fetch_shots, replace_video_session
+# NOTE: basketball_cv.run_model is imported LAZILY inside /videoUpload so the
+# server can still boot even when Roboflow SDK deps aren't installed yet.
+from db import (
+    fetch_shots,
+    replace_video_session,
+    get_roster,
+    save_roster,
+    resolve_player,
+    save_gallery_session,
+    list_gallery_sessions,
+    get_gallery_session,
+    delete_gallery_session,
+    load_gallery_session_as_current,
+)
 
 
 # Load .env BEFORE reading any environment variables.
@@ -42,22 +62,17 @@ UPLOAD_DIR = BASE_DIR / "Uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 ANNOTATED_DIR = BASE_DIR / "Annotated"
 ANNOTATED_DIR.mkdir(parents=True, exist_ok=True)
+# Persistent archive of previous annotations — each session lives under its
+# own uuid-named subdirectory: Gallery/<session_id>/{input.mp4,output.mp4,thumb.jpg}.
+GALLERY_DIR = BASE_DIR / "Gallery"
+GALLERY_DIR.mkdir(parents=True, exist_ok=True)
 
 
 ALLOWED_EXTENSIONS = {"video/mp4"}
 
-# Placeholder events the frontend renders over the timeline until the CV
-# pipeline surfaces real ones.
-DEFAULT_EVENTS = [
-    "Tip-off",
-    "First basket",
-    "Pick and roll — Team 0",
-    "Fast break",
-    "Turnover",
-    "3-point attempt",
-    "Isolation play — Team 1",
-    "Timeout",
-]
+# Distance threshold (feet) used to classify a jump shot as a three-pointer
+# when responding to natural-language queries. Matches what db.py uses.
+_THREE_POINT_DISTANCE_FT = 22.0
 
 
 def _find_annotated_video() -> Optional[Path]:
@@ -118,7 +133,7 @@ def _fmt_mmss(seconds: float) -> str:
     return f"{m}:{s:02d}"
 
 
-def _build_system_instruction() -> str:
+def _build_system_instruction(user_query: str = "") -> str:
     base = (
         "You are the AI assistant for Deep Court Analytics — a basketball "
         "computer-vision tool used by coaches and analysts. "
@@ -129,27 +144,80 @@ def _build_system_instruction() -> str:
         "STRUCTURED OUTPUT CONTRACT:\n"
         " - Always return valid JSON: { text: string, highlights: number[] }.\n"
         " - `text` is your natural-language reply.\n"
-        " - `highlights` is a list of INTEGER INDICES into the events table "
-        "below. Return indices for events that match the user's query — "
-        "e.g. 'show me the turnovers', 'shots from long range', 'first basket'. "
-        "Return an EMPTY array for greetings, summaries, or questions that "
-        "aren't about specific events."
+        " - `highlights` is a list of INTEGER INDICES — use the `[N]` values "
+        "shown in brackets in the events table below. Return indices for events "
+        "that match the user's query. Return an EMPTY array for greetings, "
+        "summaries, or questions that aren't about specific events."
     )
     video = _find_annotated_video()
     if video is None:
-        return base + "\n\nThere is no video loaded right now. The events table is empty — always return `highlights: []`."
+        return (
+            base
+            + "\n\nThere is no video loaded right now. The events table is empty — always return `highlights: []`."
+        )
+
     duration = _get_video_duration(video)
-    events = _placeholder_timestamps(duration)
-    lines = "\n".join(
-        f"  [{i}] {_fmt_mmss(e['time'])} — {e['description']}"
-        for i, e in enumerate(events)
+    shots, all_events = _all_events()
+
+    if not all_events:
+        return (
+            base
+            + f"\n\nA video is loaded ({video.name}, {_fmt_mmss(duration)}) but "
+              "no shots have been extracted yet. The events table is empty — "
+              "always return `highlights: []`."
+        )
+
+    filtered_events, original_indices = _filter_events_by_query(
+        shots, all_events, user_query
     )
+
+    if not filtered_events:
+        events_block = "  (no events match the query)"
+        scope_note = f"0 of {len(all_events)} events match"
+    else:
+        events_block = "\n".join(
+            f"  [{idx}] {_fmt_mmss(ev['time'])} — {ev['description']}"
+            for idx, ev in zip(original_indices, filtered_events)
+        )
+        scope_note = (
+            "showing all events"
+            if len(filtered_events) == len(all_events)
+            else f"pre-filtered by the user's query — {len(filtered_events)} of {len(all_events)} events shown"
+        )
+
     return (
         f"{base}\n\n"
         f"A video is currently loaded: {video.name} "
         f"({_fmt_mmss(duration)} long).\n"
-        f"Events table (placeholder until CV pipeline lands — indices are 0-based):\n{lines}"
+        f"Events table ({scope_note}; bracketed numbers are the INDICES to use in "
+        f"`highlights`):\n{events_block}"
     )
+
+
+def _extract_thumbnail(src: Path, dst: Path, at_seconds: float = 0.5) -> bool:
+    """Grab a single frame from `src` as a JPEG at `dst`.
+    Fast-seek (`-ss` before `-i`) so we don't have to decode the whole clip.
+    Returns True on success; failures are logged but non-fatal — the gallery
+    card just shows a default placeholder if the thumb is missing."""
+    cmd = [
+        FFMPEG_EXE,
+        "-y",
+        "-ss", f"{max(0.0, float(at_seconds)):.3f}",
+        "-i", str(src),
+        "-frames:v", "1",
+        "-q:v", "3",
+        str(dst),
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, timeout=30)
+        return True
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or b"").decode(errors="replace")
+        print(f"[thumbnail] ffmpeg failed: {stderr[-300:]}")
+        return False
+    except subprocess.TimeoutExpired:
+        print("[thumbnail] ffmpeg timeout after 30s")
+        return False
 
 
 def _transcode_to_h264(src: Path, dst: Path) -> bool:
@@ -181,21 +249,132 @@ def _transcode_to_h264(src: Path, dst: Path) -> bool:
         return False
 
 
-def _placeholder_timestamps(duration: float) -> list[dict]:
-    # Distribute events evenly inside the actual video duration so every event
-    # position stays inside [0, 100%] for the scrubber — no more half-clipped
-    # thumbnails on the right edge.
-    if duration <= 0:
-        duration = 120.0
-    step = duration / (len(DEFAULT_EVENTS) + 1)
-    return [
-        {
-            "time": round((i + 1) * step, 2),
-            "description": DEFAULT_EVENTS[i],
-            "thumbnail": f"https://picsum.photos/seed/{i + 1}/120/68",
-        }
-        for i in range(len(DEFAULT_EVENTS))
-    ]
+def _shot_to_event(shot: dict, index: int, roster: dict | None = None) -> dict:
+    """Translate a Mongo shot doc into the {time, description, thumbnail}
+    shape the frontend seekbar + thumbnails strip consumes.
+    Applies roster overrides so custom team/player names flow through."""
+    shot_type = shot.get("shot_type") or ""
+    distance = float(shot.get("distance_feet") or 0)
+    made = bool(shot.get("made"))
+    team_detected = (shot.get("team_name") or "").strip()
+    jersey = shot.get("player_number")
+    timestamp = float(shot.get("timestamp_seconds") or 0)
+
+    # Roster lookup — falls back to detected values if no override is set.
+    team_override, player_override = resolve_player(team_detected, jersey, roster)
+    team_display = team_override or team_detected
+    player_display = player_override or (
+        (shot.get("player_name") or "").strip() or None
+    )
+
+    if shot_type == "layup_dunk":
+        type_label = "Layup/dunk"
+    elif shot_type == "jump_shot":
+        if distance >= _THREE_POINT_DISTANCE_FT:
+            type_label = f"3PT jumper ({distance:.1f} ft)"
+        else:
+            type_label = f"Jumper ({distance:.1f} ft)"
+    else:
+        type_label = "Shot"
+
+    parts = [type_label, "made" if made else "missed"]
+    if team_display:
+        parts.append(f"— {team_display}")
+    if player_display:
+        parts.append(player_display)
+    elif jersey is not None:
+        parts.append(f"#{jersey}")
+
+    return {
+        "time": round(timestamp, 2),
+        "description": " ".join(parts),
+        "thumbnail": f"https://picsum.photos/seed/shot{index}/120/68",
+    }
+
+
+def _all_events() -> tuple[list[dict], list[dict]]:
+    """Current video's events, sourced exclusively from Mongo.
+    Returns (raw_shots, events) where `events` is the frontend-facing shape
+    and `raw_shots` are kept for keyword filtering. Empty lists when the CV
+    pipeline hasn't populated the collection yet."""
+    shots = fetch_shots()
+    roster = get_roster()
+    events = [_shot_to_event(s, i + 1, roster=roster) for i, s in enumerate(shots)]
+    return shots, events
+
+
+_THREE_POINT_KEYWORDS = (
+    "three pointer",
+    "three-pointer",
+    "three point",
+    "three-point",
+    "3 pointer",
+    "3-pointer",
+    "3-point",
+    "3pt",
+    "from downtown",
+    "beyond the arc",
+    "from deep",
+)
+_MADE_KEYWORDS = ("made", "makes", "scored", "converted", "bucket")
+_MISSED_KEYWORDS = ("missed", "miss ", " miss", "bricked", "airball")
+
+
+def _filter_events_by_query(
+    shots: list[dict], events: list[dict], user_query: str
+) -> tuple[list[dict], list[int]]:
+    """Python-side keyword filter over Mongo shot docs. Returns
+    (filtered_events, original_indices) so Gemini's highlights still line up
+    with VideoPlayer's full-shot index space."""
+    if not user_query or not events:
+        return events, list(range(len(events)))
+
+    q = user_query.lower()
+    filters: list = []
+
+    if "layup" in q or "dunk" in q or "at the rim" in q:
+        filters.append(lambda s: s.get("shot_type") == "layup_dunk")
+    elif "jumper" in q or "jump shot" in q:
+        filters.append(lambda s: s.get("shot_type") == "jump_shot")
+
+    if any(k in q for k in _THREE_POINT_KEYWORDS):
+        filters.append(
+            lambda s: float(s.get("distance_feet") or 0) >= _THREE_POINT_DISTANCE_FT
+        )
+
+    if any(k in q for k in _MISSED_KEYWORDS):
+        filters.append(lambda s: not bool(s.get("made")))
+    elif any(k in q for k in _MADE_KEYWORDS):
+        filters.append(lambda s: bool(s.get("made")))
+
+    if "celtic" in q or "boston" in q:
+        filters.append(
+            lambda s: "celtic" in (s.get("team_name") or "").lower()
+        )
+    if "knick" in q or "new york" in q or "nyk" in q:
+        filters.append(
+            lambda s: "knick" in (s.get("team_name") or "").lower()
+        )
+
+    m = re.search(r"(?:#|\bnumber\b|\bjersey\b)\s*(\d{1,2})", q)
+    if m:
+        try:
+            target = int(m.group(1))
+            filters.append(lambda s: s.get("player_number") == target)
+        except ValueError:
+            pass
+
+    if not filters:
+        return events, list(range(len(events)))
+
+    filtered_events: list[dict] = []
+    original_indices: list[int] = []
+    for idx, (shot, ev) in enumerate(zip(shots, events)):
+        if all(f(shot) for f in filters):
+            filtered_events.append(ev)
+            original_indices.append(idx)
+
+    return filtered_events, original_indices
 
 
 @app.get("/")
@@ -213,6 +392,7 @@ async def video_info():
         return {"hasVideo": False}
 
     duration = _get_video_duration(video)
+    _shots, events = _all_events()
     return {
         "hasVideo": True,
         "metadata": {
@@ -220,13 +400,15 @@ async def video_info():
             "title": video.name,
             "url": f"http://localhost:8000/videoSend/{video.name}",
         },
-        "timestamps": _placeholder_timestamps(duration),
+        # Mongo-only — empty list until the CV pipeline writes real shots.
+        "timestamps": events,
     }
 
 
 @app.get("/api/video/timestamps")
-async def video_timestamps(duration: float):
-    return _placeholder_timestamps(duration)
+async def video_timestamps(duration: float | None = None):
+    _shots, events = _all_events()
+    return events
 
 
 @app.get("/api/shots")
@@ -234,11 +416,51 @@ async def get_shots():
     return fetch_shots()
 
 
+@app.get("/api/players")
+async def players():
+    """Distinct (team, jersey_number) pairs from the current shots collection
+    plus the saved roster overrides so the editor can hydrate with both the
+    detected data and any user edits."""
+    shots = fetch_shots()
+    by_team: dict[str, set[int]] = {}
+    for s in shots:
+        team = (s.get("team_name") or "").strip()
+        jersey = s.get("player_number")
+        if not team or jersey is None:
+            continue
+        try:
+            by_team.setdefault(team, set()).add(int(jersey))
+        except (TypeError, ValueError):
+            continue
+
+    teams = [
+        {"team_color": team, "jerseys": sorted(js)}
+        for team, js in sorted(by_team.items())
+    ]
+    return {"teams": teams, "roster": get_roster()}
+
+
+class RosterRequest(BaseModel):
+    teams: dict[str, dict] = {}
+
+
+@app.get("/api/roster")
+async def roster_get():
+    return get_roster()
+
+
+@app.put("/api/roster")
+async def roster_put(body: RosterRequest):
+    save_roster(body.model_dump())
+    return get_roster()
+
+
 @app.post("/videoUpload")
 async def videoUpload(
     file: Annotated[UploadFile, File(...)],
     title: Annotated[str | None, Form()] = None,
-
+    team_0_name: Annotated[str | None, Form()] = None,
+    team_1_name: Annotated[str | None, Form()] = None,
 ):
     if file.content_type not in ALLOWED_EXTENSIONS:
         raise HTTPException(status_code=415, detail="Unsupported Media Type")
@@ -260,12 +482,66 @@ async def videoUpload(
 
     await file.close()
 
-    shots = run_model.run_model(str(dest), str(annotated_dest))
+    # Lazy import — the Roboflow/torch dependency chain is heavy and optional
+    # for everything except the upload path.
+    try:
+        import basketball_cv.run_model as run_model
+    except ImportError as e:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "CV pipeline dependencies not installed. "
+                f"Run `pip install -r requirements.txt` in the venv. ({e})"
+            ),
+        )
+
+    # User-provided team names (from the upload backboard). Blank → None so
+    # run_model falls back to the config defaults.
+    team_names_override: dict[int, str] = {}
+    if team_0_name and team_0_name.strip():
+        team_names_override[0] = team_0_name.strip()
+    if team_1_name and team_1_name.strip():
+        team_names_override[1] = team_1_name.strip()
+
+    shots = run_model.run_model(
+        str(dest), str(annotated_dest),
+        team_names=team_names_override or None,
+    )
+
+    # OpenCV's VideoWriter (used inside run_model) writes FMP4 / MPEG-4 Part 2
+    # by default, which browsers can't decode. Re-encode the annotated output
+    # in place to H.264/AAC so <video> plays it. Does a tmp-file swap so the
+    # original annotated file isn't corrupted if ffmpeg fails.
+    tmp_dest = annotated_dest.with_suffix(annotated_dest.suffix + ".h264.tmp.mp4")
+    if _transcode_to_h264(annotated_dest, tmp_dest):
+        annotated_dest.unlink()
+        tmp_dest.rename(annotated_dest)
+        print(f"[transcode] annotated video re-encoded to H.264: {annotated_dest.name}")
+    else:
+        # Leave the raw FMP4 output — browser will show the codec-error overlay
+        # but at least the shots data is still good.
+        if tmp_dest.exists():
+            tmp_dest.unlink()
+        print("[transcode] ffmpeg step failed, leaving raw annotated output as-is")
+
     shot_count = replace_video_session(
         shots,
         source_video=dest.name,
         annotated_video=annotated_dest.name,
     )
+
+    # Auto-snapshot this annotation into the gallery so the user can reload it
+    # later without re-running the CV pipeline. Any failure here is logged but
+    # does NOT fail the upload — the current session is already live.
+    gallery_session_id = None
+    try:
+        gallery_session_id = _snapshot_to_gallery(
+            raw_input=dest,
+            annotated_output=annotated_dest,
+            title=title or (file.filename or filename),
+        )
+    except Exception as e:
+        print(f"[gallery] snapshot failed ({e.__class__.__name__}: {e})")
 
     return {
         "message": "uploaded",
@@ -275,7 +551,51 @@ async def videoUpload(
         "annotated_filename": annotated_dest.name,
         "shots_stored": shot_count,
         "content_type": file.content_type,
+        "gallery_session_id": gallery_session_id,
     }
+
+
+def _snapshot_to_gallery(
+    *,
+    raw_input: Path,
+    annotated_output: Path,
+    title: str,
+) -> str:
+    """Copy the just-annotated pair into Gallery/<sid>/, extract a thumbnail,
+    and persist a metadata + shots + roster snapshot to Mongo. Returns the
+    session id. Raises on unrecoverable errors; caller catches and logs."""
+    session_id = uuid.uuid4().hex
+    session_dir = GALLERY_DIR / session_id
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    input_copy = session_dir / "input.mp4"
+    output_copy = session_dir / "output.mp4"
+    thumb_copy = session_dir / "thumb.jpg"
+
+    shutil.copy2(raw_input, input_copy)
+    shutil.copy2(annotated_output, output_copy)
+
+    duration = _get_video_duration(output_copy)
+    thumb_at = max(0.5, duration * 0.1)
+    _extract_thumbnail(output_copy, thumb_copy, at_seconds=thumb_at)
+
+    # Pull shots + roster from Mongo as they stand right now — these were just
+    # written by `replace_video_session` above.
+    current_shots = fetch_shots()
+    current_roster = get_roster()
+
+    save_gallery_session(
+        session_id=session_id,
+        title=title.strip() or f"session-{session_id[:8]}",
+        duration_seconds=duration,
+        input_video_relpath=f"{session_id}/input.mp4",
+        annotated_video_relpath=f"{session_id}/output.mp4",
+        thumbnail_relpath=f"{session_id}/thumb.jpg",
+        shots=current_shots,
+        roster=current_roster,
+    )
+    print(f"[gallery] snapshot saved: {session_id} ({title}, {len(current_shots)} shots)")
+    return session_id
 
 
 @app.get("/videoSend/{filename}")
@@ -290,6 +610,142 @@ async def send_video(filename: str):
         path=video_path,
         media_type="video/mp4",
     )
+
+
+# --------------------------------------------------------------------
+# Gallery — persistent archive of past annotated sessions.
+# --------------------------------------------------------------------
+
+
+def _gallery_entry_public(entry: dict) -> dict:
+    """Shape a gallery doc for the frontend: IDs, URLs, meta — no shots array.
+    URLs are server-rooted so the frontend doesn't need to know the filesystem
+    layout; both `thumbnail_url` and `video_url` are absolute-from-origin."""
+    sid = entry.get("_id") or entry.get("session_id")
+    created_at = entry.get("created_at")
+    return {
+        "session_id": sid,
+        "title": entry.get("title") or "",
+        "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else created_at,
+        "duration_seconds": float(entry.get("duration_seconds") or 0),
+        "shot_count": int(entry.get("shot_count") or 0),
+        "thumbnail_url": f"/api/gallery/{sid}/thumbnail",
+        "video_url": f"/api/gallery/{sid}/video",
+    }
+
+
+@app.get("/api/gallery")
+async def gallery_list():
+    entries = list_gallery_sessions()
+    return [_gallery_entry_public(e) for e in entries]
+
+
+class SaveCurrentRequest(BaseModel):
+    title: Optional[str] = None
+
+
+@app.post("/api/gallery/save-current")
+async def gallery_save_current(body: SaveCurrentRequest | None = None):
+    """Snapshot the currently-loaded session (Uploads/input.mp4 + Annotated/
+    output.mp4 + current Mongo shots + roster) into the gallery without
+    re-running the CV pipeline. Use this after an upload that happened before
+    the auto-snapshot logic was in place, or to re-save after editing the
+    roster. Title falls back to the source filename."""
+    annotated = _find_annotated_video()
+    if annotated is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No annotated video loaded — upload a clip first.",
+        )
+
+    # The raw input lives in UPLOAD_DIR with a matching or related filename.
+    # Fall back to any *.mp4 under UPLOAD_DIR; the CV pipeline only keeps one.
+    raw_inputs = sorted(UPLOAD_DIR.glob("*.mp4")) if UPLOAD_DIR.exists() else []
+    raw_input = raw_inputs[0] if raw_inputs else annotated  # copy the annotated twice if no raw
+
+    title = (body.title if body else None) or annotated.stem or "Saved session"
+
+    try:
+        session_id = _snapshot_to_gallery(
+            raw_input=raw_input,
+            annotated_output=annotated,
+            title=title,
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Gallery snapshot failed: {e.__class__.__name__}: {e}",
+        )
+
+    return {"saved": True, "session_id": session_id, "title": title}
+
+
+@app.get("/api/gallery/{session_id}/thumbnail")
+async def gallery_thumbnail(session_id: str):
+    thumb_path = GALLERY_DIR / session_id / "thumb.jpg"
+    if not thumb_path.exists():
+        raise HTTPException(status_code=404, detail="Thumbnail not found")
+    return FileResponse(path=thumb_path, media_type="image/jpeg")
+
+
+@app.get("/api/gallery/{session_id}/video")
+async def gallery_video(session_id: str):
+    video_path = GALLERY_DIR / session_id / "output.mp4"
+    if not video_path.exists():
+        raise HTTPException(status_code=404, detail="Gallery video not found")
+    return FileResponse(path=video_path, media_type="video/mp4")
+
+
+@app.post("/api/gallery/{session_id}/load")
+async def gallery_load(session_id: str):
+    """Restore a saved session as the current one: Mongo state + the single
+    `Uploads/input.mp4` + `Annotated/output.mp4` slots both get replaced with
+    the gallery entry's files. The Film page's existing /api/video/info flow
+    then picks it up like a fresh upload."""
+    entry = load_gallery_session_as_current(session_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Gallery session not found")
+
+    session_dir = GALLERY_DIR / session_id
+    gallery_input = session_dir / "input.mp4"
+    gallery_output = session_dir / "output.mp4"
+    if not gallery_output.exists():
+        raise HTTPException(
+            status_code=410,
+            detail="Gallery video files missing on disk — entry may be stale",
+        )
+
+    # Clear any current file slots before copying so the copy is deterministic
+    # regardless of what extension/name the previous upload used.
+    for folder in (UPLOAD_DIR, ANNOTATED_DIR):
+        if folder.exists():
+            for mp4 in folder.glob("*.mp4"):
+                try:
+                    mp4.unlink()
+                except OSError:
+                    pass
+
+    shutil.copy2(gallery_output, ANNOTATED_DIR / "output.mp4")
+    if gallery_input.exists():
+        shutil.copy2(gallery_input, UPLOAD_DIR / "input.mp4")
+
+    print(f"[gallery] loaded session {session_id} into current slots")
+    return {
+        "loaded": True,
+        "session_id": session_id,
+        "title": entry.get("title") or "",
+    }
+
+
+@app.delete("/api/gallery/{session_id}")
+async def gallery_delete(session_id: str):
+    removed = delete_gallery_session(session_id)
+    session_dir = GALLERY_DIR / session_id
+    if session_dir.exists():
+        shutil.rmtree(session_dir, ignore_errors=True)
+    if not removed:
+        raise HTTPException(status_code=404, detail="Gallery session not found")
+    return {"deleted": True, "session_id": session_id}
 
 
 CHAT_RESPONSE_SCHEMA = {
@@ -355,7 +811,9 @@ def _call_gemini(req: ChatRequest) -> tuple[str, list[int]]:
     # the separate `system_instruction` config field with
     # "Developer instruction is not enabled for models/gemma-*".
     # Inlining works equally well for both Gemma and Gemini models.
-    system_txt = _build_system_instruction()
+    # Pass req.message so the system prompt can pre-filter the shots table
+    # against the user's keywords via Mongo.
+    system_txt = _build_system_instruction(req.message)
     inlined_message = f"{system_txt}\n\n---\n\nUser message: {req.message}"
 
     recent = req.history[-20:]

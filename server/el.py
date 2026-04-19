@@ -12,7 +12,6 @@ for voice in voices.voices:
     print(f"{voice.name}")
 
 
-
 audio = client.text_to_speech.convert(
     text="He pulls up from deep... BANG! What a shot!",
     voice_id="JBFqnCBsd6RMkjVDRZzb",
