@@ -5,6 +5,8 @@ from pydantic import BaseModel
 from pathlib import Path
 from typing import Annotated, Optional, Literal
 import os
+import json
+import re
 import shutil
 import subprocess
 import imageio_ffmpeg
@@ -85,7 +87,7 @@ FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 # Missing key isn't fatal: server still boots, /api/chat degrades to 500.
 # --------------------------------------------------------------------
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemma-3-27b-it")
 _gemini_client: Optional["genai.Client"] = None
 if GEMINI_API_KEY:
     try:
@@ -117,24 +119,33 @@ def _build_system_instruction() -> str:
     base = (
         "You are the AI assistant for Deep Court Analytics — a basketball "
         "computer-vision tool used by coaches and analysts. "
-        "Be concise, basketball-literate, and cite timestamps (mm:ss) when the "
-        "user asks about specific events. If no video is loaded, tell the user "
-        "to upload one on the Film page. If the user asks something you don't "
-        "have data for, say so honestly rather than guessing."
+        "Be concise (1–3 sentences unless summarising), basketball-literate, "
+        "and cite timestamps (mm:ss) when the user asks about specific events. "
+        "If no video is loaded, tell the user to upload one on the Film page. "
+        "If you don't have data for something, say so honestly rather than guessing.\n\n"
+        "STRUCTURED OUTPUT CONTRACT:\n"
+        " - Always return valid JSON: { text: string, highlights: number[] }.\n"
+        " - `text` is your natural-language reply.\n"
+        " - `highlights` is a list of INTEGER INDICES into the events table "
+        "below. Return indices for events that match the user's query — "
+        "e.g. 'show me the turnovers', 'shots from long range', 'first basket'. "
+        "Return an EMPTY array for greetings, summaries, or questions that "
+        "aren't about specific events."
     )
     video = _find_annotated_video()
     if video is None:
-        return base + "\n\nThere is no video loaded right now."
+        return base + "\n\nThere is no video loaded right now. The events table is empty — always return `highlights: []`."
     duration = _get_video_duration(video)
     events = _placeholder_timestamps(duration)
     lines = "\n".join(
-        f"- {_fmt_mmss(e['time'])} — {e['description']}" for e in events
+        f"  [{i}] {_fmt_mmss(e['time'])} — {e['description']}"
+        for i, e in enumerate(events)
     )
     return (
         f"{base}\n\n"
         f"A video is currently loaded: {video.name} "
         f"({_fmt_mmss(duration)} long).\n"
-        f"Detected events (placeholder data until the CV pipeline lands):\n{lines}"
+        f"Events table (placeholder until CV pipeline lands — indices are 0-based):\n{lines}"
     )
 
 
@@ -168,12 +179,15 @@ def _transcode_to_h264(src: Path, dst: Path) -> bool:
 
 
 def _placeholder_timestamps(duration: float) -> list[dict]:
-    if duration < len(DEFAULT_EVENTS):
-        duration = float(len(DEFAULT_EVENTS))
+    # Distribute events evenly inside the actual video duration so every event
+    # position stays inside [0, 100%] for the scrubber — no more half-clipped
+    # thumbnails on the right edge.
+    if duration <= 0:
+        duration = 120.0
     step = duration / (len(DEFAULT_EVENTS) + 1)
     return [
         {
-            "time": round((i + 1) * step, 1),
+            "time": round((i + 1) * step, 2),
             "description": DEFAULT_EVENTS[i],
             "thumbnail": f"https://picsum.photos/seed/{i + 1}/120/68",
         }
@@ -267,9 +281,55 @@ async def send_video(filename: str):
     )
 
 
-@app.post("/api/chat")
-async def chat(req: ChatRequest):
-    """Send the user's message to Gemini with system prompt + truncated history."""
+CHAT_RESPONSE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "text": {"type": "STRING"},
+        "highlights": {
+            "type": "ARRAY",
+            "items": {"type": "INTEGER"},
+        },
+    },
+    "required": ["text", "highlights"],
+}
+
+
+class RateLimitError(Exception):
+    """Signals the Gemini free-tier 429; caller may fall back to Ollama."""
+
+    def __init__(self, retry_after: int):
+        self.retry_after = retry_after
+
+
+def _parse_chat_json(raw: str) -> tuple[str, list[int]]:
+    """Parse the {text, highlights[]} JSON blob both providers emit.
+    Defensive against truncation, floats-as-strings, schema drift, and
+    markdown code-fence wrapping (common with Gemma/Ollama)."""
+    text = ""
+    highlights: list[int] = []
+
+    cleaned = (raw or "").strip()
+    # Strip ```json ... ``` or ``` ... ``` fences.
+    fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", cleaned, re.DOTALL)
+    if fence:
+        cleaned = fence.group(1).strip()
+
+    try:
+        parsed = json.loads(cleaned) if cleaned else {}
+        text = str(parsed.get("text", "")).strip()
+        for h in parsed.get("highlights") or []:
+            try:
+                highlights.append(int(h))
+            except (TypeError, ValueError):
+                continue
+    except json.JSONDecodeError:
+        text = cleaned or raw
+    if not text:
+        text = "(no response)"
+    return text, highlights
+
+
+def _call_gemini(req: ChatRequest) -> tuple[str, list[int]]:
     if _gemini_client is None:
         raise HTTPException(
             status_code=500,
@@ -279,31 +339,72 @@ async def chat(req: ChatRequest):
             ),
         )
 
-    # Cap history to keep prompts small and bounded.
-    recent = req.history[-20:]
+    # Inline the system instruction as a prefix to the CURRENT user message.
+    # Reason: Gemma models (served via the same Gemini API endpoint) reject
+    # the separate `system_instruction` config field with
+    # "Developer instruction is not enabled for models/gemma-*".
+    # Inlining works equally well for both Gemma and Gemini models.
+    system_txt = _build_system_instruction()
+    inlined_message = f"{system_txt}\n\n---\n\nUser message: {req.message}"
 
+    recent = req.history[-20:]
     contents = []
     for m in recent:
         role = "user" if m.sender == "user" else "model"
         contents.append({"role": role, "parts": [{"text": m.text}]})
-    contents.append({"role": "user", "parts": [{"text": req.message}]})
+    contents.append({"role": "user", "parts": [{"text": inlined_message}]})
+
+    # JSON-mode + response_schema is supported by gemini-* models only.
+    # Gemma-* models served via the same API reject it with
+    # "JSON mode is not enabled for models/gemma-*". Fall back to plain
+    # generation + best-effort JSON parsing (system prompt already instructs
+    # the model to emit our JSON shape).
+    config_kwargs: dict = {}
+    if GEMINI_MODEL.startswith("gemini-"):
+        config_kwargs["response_mime_type"] = "application/json"
+        config_kwargs["response_schema"] = CHAT_RESPONSE_SCHEMA
 
     try:
         response = _gemini_client.models.generate_content(
             model=GEMINI_MODEL,
             contents=contents,
-            config=genai_types.GenerateContentConfig(
-                system_instruction=_build_system_instruction(),
-            ),
+            config=genai_types.GenerateContentConfig(**config_kwargs),
         )
     except Exception as e:
+        msg = str(e)
+        if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+            retry_after = 30
+            m = re.search(r"retryDelay['\"]?:\s*['\"](\d+(?:\.\d+)?)s", msg)
+            if not m:
+                m = re.search(r"retry in (\d+(?:\.\d+)?)s", msg)
+            if m:
+                try:
+                    retry_after = int(float(m.group(1))) + 2
+                except ValueError:
+                    pass
+            retry_after = max(5, min(120, retry_after))
+            raise RateLimitError(retry_after)
         print(f"[chat] Gemini call failed: {e}")
-        raise HTTPException(status_code=502, detail=f"Gemini upstream error: {e}")
+        raise HTTPException(
+            status_code=502, detail=f"Gemini upstream error: {e}")
 
-    text = (response.text or "").strip()
-    if not text:
-        text = "(no response)"
-    return {"text": text}
+    return _parse_chat_json((response.text or "").strip())
+
+
+@app.post("/api/chat")
+async def chat(req: ChatRequest):
+    """Send the user's message to Gemini/Gemma via Google AI Studio.
+    Returns { text, highlights[] } where highlights is the list of event
+    indices the frontend uses to filter the seekbar + thumbnails."""
+    try:
+        text, highlights = _call_gemini(req)
+    except RateLimitError as rl:
+        print(f"[chat] rate-limited; frontend should wait {rl.retry_after}s")
+        raise HTTPException(
+            status_code=429,
+            detail={"error": "rate_limited", "retry_after": rl.retry_after},
+        )
+    return {"text": text, "highlights": highlights}
 
 
 @app.delete("/api/video")

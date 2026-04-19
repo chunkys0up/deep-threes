@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import { Play, Pause, Volume2, VolumeX, Maximize, Minimize, ZoomIn, ZoomOut, X, AlertTriangle } from "lucide-react";
 
 const API_BASE_URL = "http://localhost:8000";
@@ -33,7 +33,12 @@ function HoopIcon({ className }) {
   );
 }
 
-export default function VideoPlayer({ isTheaterMode = false, onTheaterToggle }) {
+export default function VideoPlayer({
+  isTheaterMode = false,
+  onTheaterToggle,
+  highlightFilter = null,
+  onTimestampsChange,
+}) {
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -57,11 +62,29 @@ export default function VideoPlayer({ isTheaterMode = false, onTheaterToggle }) 
   const containerRef = useRef(null);
   const controlsTimeoutRef = useRef(null);
   const timelineContainerRef = useRef(null);
+  const seekBarWrapperRef = useRef(null);
   const fileInputRef = useRef(null);
 
   useEffect(() => {
     fetchVideoInfo();
   }, []);
+
+  // ─── FIX 2: Attach non-passive wheel listeners so preventDefault() actually works ───
+  // React attaches onWheel as a passive listener by default, which silently ignores
+  // e.preventDefault(), letting the page scroll through. We attach native listeners
+  // with { passive: false } on both the seek-bar wrapper and the events timeline so
+  // the browser honours our scroll interception.
+  useEffect(() => {
+    const elements = [timelineContainerRef.current, seekBarWrapperRef.current];
+    const cleanups = elements.map((el) => {
+      if (!el) return () => {};
+      const handler = (e) => handleWheel(e);
+      el.addEventListener("wheel", handler, { passive: false });
+      return () => el.removeEventListener("wheel", handler);
+    });
+    return () => cleanups.forEach((fn) => fn());
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [zoomLevel, scrollPosition, currentTime, duration]);
 
   const fetchVideoInfo = async () => {
     try {
@@ -80,11 +103,13 @@ export default function VideoPlayer({ isTheaterMode = false, onTheaterToggle }) 
         setVideoUrl("");
         setTimestamps([]);
         setDuration(0);
+        onTimestampsChange?.([], null);
       } else {
         setHasVideo(true);
         setTimestamps(data.timestamps);
         setDuration(data.metadata.duration);
         setVideoUrl(data.metadata.url);
+        onTimestampsChange?.(data.timestamps, data.metadata.url);
       }
       setLoading(false);
     } catch (err) {
@@ -167,6 +192,7 @@ export default function VideoPlayer({ isTheaterMode = false, onTheaterToggle }) 
       if (response.ok) {
         const newTimestamps = await response.json();
         setTimestamps(newTimestamps);
+        onTimestampsChange?.(newTimestamps, videoUrl);
       }
     } catch (err) {
       console.error("Failed to fetch timestamps:", err);
@@ -188,6 +214,17 @@ export default function VideoPlayer({ isTheaterMode = false, onTheaterToggle }) 
     }
   };
 
+  // ─── FIX 1: Seek bar window helpers ───────────────────────────────────────────
+  // Derive the visible time window from zoomLevel + scrollPosition so that both
+  // the seek bar and the progress fill only represent the zoomed slice.
+  const maxDuration = duration || 120;
+  const windowSize = maxDuration / zoomLevel;
+  const centerTime = scrollPosition * maxDuration;
+  const windowStart = Math.max(0, Math.min(centerTime - windowSize / 2, maxDuration - windowSize));
+  const windowEnd = windowStart + windowSize;
+  const clampedCurrentTime = Math.min(Math.max(currentTime, windowStart), windowEnd);
+  const progressPercent = ((clampedCurrentTime - windowStart) / (windowEnd - windowStart)) * 100;
+
   const handleTimelineChange = (e) => {
     const newTime = parseFloat(e.target.value);
     setCurrentTime(newTime);
@@ -196,7 +233,6 @@ export default function VideoPlayer({ isTheaterMode = false, onTheaterToggle }) 
     }
 
     if (zoomLevel > 1) {
-      const maxDuration = duration || 120;
       setScrollPosition(newTime / maxDuration);
     }
   };
@@ -247,40 +283,30 @@ export default function VideoPlayer({ isTheaterMode = false, onTheaterToggle }) 
     if (controlsTimeoutRef.current) {
       clearTimeout(controlsTimeoutRef.current);
     }
+    // Hide the overlay after 2s of mouse idleness, regardless of play state.
     controlsTimeoutRef.current = setTimeout(() => {
-      if (isPlaying) {
-        setShowControls(false);
-      }
-    }, 3000);
+      setShowControls(false);
+    }, 2000);
   };
 
   const handleWheel = (e) => {
-    e.preventDefault();
+    e.preventDefault(); // Now actually works — listener is non-passive (Fix 2)
     if (e.ctrlKey || e.metaKey) {
       const delta = -e.deltaY * 0.01;
       const newZoom = Math.max(1, Math.min(10, zoomLevel + delta));
       setZoomLevel(newZoom);
 
       if (newZoom > 1) {
-        const maxDuration = duration || 120;
         const mousePositionRatio = currentTime / maxDuration;
         setScrollPosition(mousePositionRatio);
       }
     } else {
       const newScroll = Math.max(0, Math.min(1, scrollPosition + e.deltaY * 0.001));
       setScrollPosition(newScroll);
-
-      if (zoomLevel > 1) {
-        const maxDuration = duration || 120;
-        const centerTime = newScroll * maxDuration;
-        if (videoRef.current && Math.abs(centerTime - currentTime) > maxDuration * 0.1) {
-        }
-      }
     }
   };
 
   const getTimestampPosition = (time) => {
-    const maxDuration = duration || 120;
     const basePosition = (time / maxDuration) * 100;
     const centerTime = scrollPosition * maxDuration;
     const centerPosition = 50;
@@ -339,6 +365,14 @@ export default function VideoPlayer({ isTheaterMode = false, onTheaterToggle }) 
   if (!hasVideo) {
     return (
       <div className="w-full bg-[#0a1128] rounded-2xl overflow-hidden border border-[#1b3a6b] shadow-[0_20px_60px_-20px_rgba(0,0,0,0.7)]">
+        {/* ─── FIX 4: Compact single-line header ──────────────────────────────── */}
+        <div className="px-5 py-2.5 flex items-center gap-3 border-b border-[#1b3a6b]">
+          <span className="text-[#f4ecd8] font-semibold text-sm tracking-wide" style={{ fontFamily: 'var(--heading)' }}>
+            Film Room
+          </span>
+          <span className="text-[#7a89a8] text-xs">AI-powered play-by-play event timeline</span>
+        </div>
+
         <div
           onDragOver={handleDragOver}
           onDragLeave={handleDragLeave}
@@ -402,19 +436,29 @@ export default function VideoPlayer({ isTheaterMode = false, onTheaterToggle }) 
   return (
     <div
       ref={containerRef}
-      className="w-full bg-black rounded-2xl overflow-hidden border border-[#1b3a6b] shadow-[0_20px_60px_-20px_rgba(0,0,0,0.7)]"
+      className="w-full h-full flex flex-col bg-black rounded-2xl overflow-hidden border border-[#1b3a6b] shadow-[0_20px_60px_-20px_rgba(0,0,0,0.7)]"
       onMouseMove={handleMouseMove}
-      onMouseLeave={() => isPlaying && setShowControls(false)}
+      onMouseLeave={() => setShowControls(false)}
     >
+      {/* Top header — always visible, sits above the video */}
+      <div className="px-5 py-2.5 flex items-center gap-3 border-b border-[#1b3a6b] bg-[#0a1128] flex-shrink-0">
+        <span className="text-[#f4ecd8] font-semibold text-sm tracking-wide" style={{ fontFamily: 'var(--heading)' }}>
+          Film Room
+        </span>
+        <span className="text-[#7a89a8] text-xs truncate">AI-powered play-by-play event timeline</span>
+      </div>
+
       {error && (
-        <div className="bg-[rgba(217,164,65,0.12)] border-l-2 border-[#d9a441] p-2 text-[#f4ecd8] text-xs">
+        <div className="bg-[rgba(217,164,65,0.12)] border-l-2 border-[#d9a441] p-2 text-[#f4ecd8] text-xs flex-shrink-0">
           {error}
         </div>
       )}
-      <div className="relative">
+
+      {/* Video area — the hover overlay (thumbnails + seek + controls) lives inside */}
+      <div className="relative flex-1 min-h-0">
         <video
           ref={videoRef}
-          className="w-full aspect-video bg-black"
+          className="w-full h-full object-contain bg-black"
           onClick={togglePlay}
           onTimeUpdate={handleTimeUpdate}
           onLoadedMetadata={handleLoadedMetadata}
@@ -424,7 +468,7 @@ export default function VideoPlayer({ isTheaterMode = false, onTheaterToggle }) 
         />
 
         {playbackError && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-[#0a1128]/90 backdrop-blur-sm px-6 text-center">
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-[#0a1128]/90 backdrop-blur-sm px-6 text-center z-30">
             <AlertTriangle className="w-10 h-10 text-[#d9a441]" />
             <p className="text-[#f4ecd8] text-lg font-medium" style={{ fontFamily: 'var(--heading)' }}>
               Couldn&rsquo;t play this video
@@ -449,14 +493,155 @@ export default function VideoPlayer({ isTheaterMode = false, onTheaterToggle }) 
           onClick={handleRemoveVideo}
           aria-label="Remove video and return to upload"
           title="Remove video"
-          className="absolute top-3 right-3 z-20 p-2 rounded-full bg-black/55 hover:bg-[rgba(217,164,65,0.85)] hover:text-[#0a1128] backdrop-blur-sm text-[#f4ecd8] transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#d9a441]"
+          className={`absolute top-3 right-3 z-20 p-2 rounded-full bg-black/55 hover:bg-[rgba(217,164,65,0.85)] hover:text-[#0a1128] backdrop-blur-sm text-[#f4ecd8] transition-all duration-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#d9a441] ${
+            showControls ? 'opacity-100' : 'opacity-0 pointer-events-none'
+          }`}
         >
           <X className="w-4 h-4" strokeWidth={2.4} />
         </button>
-      </div>
 
-      <div className="bg-gradient-to-b from-[#1a1a3e]/90 to-[#0a0a1f]/90 backdrop-blur-sm border-t border-white/10">
-        <div className="p-4 flex items-center justify-between text-white">
+        {/* Hover overlay — thumbnails → seekbar → controls, stacked top-to-bottom */}
+        <div
+          className={`absolute bottom-0 left-0 right-0 z-10 bg-gradient-to-t from-black/95 via-black/75 to-transparent backdrop-blur-sm transition-all duration-200 ${
+            showControls
+              ? 'opacity-100 translate-y-0 pointer-events-auto'
+              : 'opacity-0 translate-y-2 pointer-events-none'
+          }`}
+        >
+          {/* 1. Event thumbnails */}
+          <div
+            ref={timelineContainerRef}
+            className="relative h-32 px-4 pt-3 pb-1 overflow-hidden"
+          >
+            <div className="relative w-full h-full">
+              {timestamps.map((timestamp, index) => {
+                if (highlightFilter && !highlightFilter.includes(index)) return null;
+                if (!isTimestampVisible(timestamp.time)) return null;
+
+                const position = getTimestampPosition(timestamp.time);
+                const opacity = getTimestampOpacity(timestamp.time);
+                const zIndex = getZIndex(index, timestamp.time);
+                const isHovered = hoveredTimestamp === index;
+
+                return (
+                  <div
+                    key={index}
+                    className="absolute transition-all duration-200"
+                    style={{
+                      left: `${position}%`,
+                      transform: `translateX(-50%) ${isHovered ? 'scale(1.1) translateY(-8px)' : 'scale(1)'}`,
+                      opacity,
+                      zIndex,
+                    }}
+                    onMouseEnter={() => setHoveredTimestamp(index)}
+                    onMouseLeave={() => setHoveredTimestamp(null)}
+                    onClick={() => {
+                      setCurrentTime(timestamp.time);
+                      if (videoRef.current) {
+                        videoRef.current.currentTime = timestamp.time;
+                      }
+                    }}
+                  >
+                    <div
+                      className={`w-24 bg-black/90 backdrop-blur-sm rounded-lg overflow-hidden cursor-pointer border-2 transition-all ${
+                        isHovered
+                          ? 'border-cyan-400 shadow-[0_0_20px_rgba(34,211,238,0.6)]'
+                          : 'border-white/20'
+                      }`}
+                    >
+                      <img
+                        src={timestamp.thumbnail}
+                        alt={timestamp.description}
+                        className="h-14 object-cover"
+                      />
+                      <div className="px-2 py-1.5 space-y-0.5">
+                        <p className="text-cyan-400 text-xs font-mono">
+                          {formatTime(timestamp.time)}
+                        </p>
+                        <p className="text-white/90 text-xs leading-tight truncate">
+                          {timestamp.description}
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* 2. Seek bar (+ zoom controls on the right) */}
+          <div className="px-4 pb-2">
+            <div className="flex items-center gap-3">
+              <div className="flex-1 relative" ref={seekBarWrapperRef}>
+                <div className="relative">
+                  <input
+                    type="range"
+                    min={windowStart}
+                    max={windowEnd}
+                    step={0.01}
+                    value={clampedCurrentTime}
+                    onChange={handleTimelineChange}
+                    className="relative z-10 w-full h-1.5 bg-transparent rounded-full appearance-none cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-cyan-400 [&::-webkit-slider-thumb]:cursor-pointer [&::-webkit-slider-thumb]:shadow-[0_0_8px_rgba(34,211,238,0.8)] hover:[&::-webkit-slider-thumb]:scale-125 [&::-webkit-slider-thumb]:transition-transform [&::-webkit-slider-thumb]:relative [&::-webkit-slider-thumb]:z-20"
+                  />
+                  <div className="absolute top-0 left-0 right-0 h-1.5 bg-white/20 rounded-full pointer-events-none">
+                    <div
+                      className="absolute h-full bg-cyan-400/50 rounded-full transition-all"
+                      style={{ width: `${progressPercent}%` }}
+                    />
+                  </div>
+
+                  {timestamps.map((timestamp, index) => {
+                    if (highlightFilter && !highlightFilter.includes(index)) return null;
+                    const position = getTimestampPosition(timestamp.time);
+                    const isVisible = isTimestampVisible(timestamp.time);
+                    const opacity = getTimestampOpacity(timestamp.time);
+                    if (!isVisible || opacity < 0.1) return null;
+                    return (
+                      <div
+                        key={index}
+                        className="absolute top-1/2 -translate-x-1/2 -translate-y-1/2 pointer-events-none transition-all duration-200"
+                        style={{
+                          left: `${position}%`,
+                          opacity: opacity,
+                          zIndex: hoveredTimestamp === index ? 15 : 5,
+                        }}
+                      >
+                        <div
+                          className={`w-0.5 h-3 rounded-full transition-all ${
+                            hoveredTimestamp === index
+                              ? 'bg-cyan-300 h-4 w-1 shadow-[0_0_8px_rgba(34,211,238,0.8)]'
+                              : 'bg-white/60'
+                          }`}
+                        />
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+              <div className="flex items-center gap-1">
+                <button
+                  onClick={() => setZoomLevel((z) => Math.max(1, z - 1))}
+                  className="p-1.5 bg-white/10 hover:bg-white/20 text-white rounded transition-colors"
+                  aria-label="Zoom out"
+                >
+                  <ZoomOut className="w-4 h-4" />
+                </button>
+                <span className="text-white/80 text-xs min-w-[35px] text-center">
+                  {zoomLevel.toFixed(1)}x
+                </span>
+                <button
+                  onClick={() => setZoomLevel((z) => Math.min(10, z + 1))}
+                  className="p-1.5 bg-white/10 hover:bg-white/20 text-white rounded transition-colors"
+                  aria-label="Zoom in"
+                >
+                  <ZoomIn className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {/* 3. Video options: play/pause, volume, time, theater, fullscreen */}
+          <div className="p-4 pt-2 flex items-center justify-between text-white">
           <div className="flex items-center gap-3">
             <button
               onClick={togglePlay}
@@ -489,8 +674,14 @@ export default function VideoPlayer({ isTheaterMode = false, onTheaterToggle }) 
               />
             </div>
 
+            {/* ─── FIX 1: Show zoomed window timestamps instead of full duration ── */}
+            {/* Before: always showed 0:00 / {duration}                              */}
+            {/* After: shows windowStart..windowEnd when zoomed in                   */}
             <span className="text-sm">
-              {formatTime(currentTime)} / {formatTime(duration || 120)}
+              {formatTime(currentTime)} /{" "}
+              {zoomLevel > 1
+                ? `${formatTime(windowStart)}–${formatTime(windowEnd)}`
+                : formatTime(maxDuration)}
             </span>
           </div>
 
@@ -511,135 +702,6 @@ export default function VideoPlayer({ isTheaterMode = false, onTheaterToggle }) 
             </button>
           </div>
         </div>
-
-        <div className="px-4 pb-2">
-          <div className="flex items-center gap-3">
-            <div className="flex-1 relative" onWheel={handleWheel}>
-              <div className="relative">
-                <input
-                  type="range"
-                  min="0"
-                  max={duration || 120}
-                  value={currentTime}
-                  onChange={handleTimelineChange}
-                  className="relative z-10 w-full h-1.5 bg-transparent rounded-full appearance-none cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-cyan-400 [&::-webkit-slider-thumb]:cursor-pointer [&::-webkit-slider-thumb]:shadow-[0_0_8px_rgba(34,211,238,0.8)] hover:[&::-webkit-slider-thumb]:scale-125 [&::-webkit-slider-thumb]:transition-transform [&::-webkit-slider-thumb]:relative [&::-webkit-slider-thumb]:z-20"
-                />
-                <div className="absolute top-0 left-0 right-0 h-1.5 bg-white/20 rounded-full pointer-events-none">
-                  <div
-                    className="absolute h-full bg-cyan-400/50 rounded-full transition-all"
-                    style={{ width: `${(currentTime / (duration || 120)) * 100}%` }}
-                  />
-                </div>
-
-                {timestamps.map((timestamp, index) => {
-                  const position = getTimestampPosition(timestamp.time);
-                  const isVisible = isTimestampVisible(timestamp.time);
-                  const opacity = getTimestampOpacity(timestamp.time);
-
-                  if (!isVisible || opacity < 0.1) return null;
-
-                  return (
-                    <div
-                      key={index}
-                      className="absolute top-1/2 -translate-y-1/2 pointer-events-none transition-all duration-200"
-                      style={{
-                        left: `${position}%`,
-                        opacity: opacity,
-                        zIndex: hoveredTimestamp === index ? 15 : 5,
-                      }}
-                    >
-                      <div
-                        className={`w-0.5 h-3 rounded-full transition-all ${
-                          hoveredTimestamp === index
-                            ? 'bg-cyan-300 h-4 w-1 shadow-[0_0_8px_rgba(34,211,238,0.8)]'
-                            : 'bg-white/60'
-                        }`}
-                      />
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-            <div className="flex items-center gap-1">
-              <button
-                onClick={() => setZoomLevel((z) => Math.max(1, z - 1))}
-                className="p-1.5 bg-white/10 hover:bg-white/20 text-white rounded transition-colors"
-                aria-label="Zoom out"
-              >
-                <ZoomOut className="w-4 h-4" />
-              </button>
-              <span className="text-white/80 text-xs min-w-[35px] text-center">
-                {zoomLevel.toFixed(1)}x
-              </span>
-              <button
-                onClick={() => setZoomLevel((z) => Math.min(10, z + 1))}
-                className="p-1.5 bg-white/10 hover:bg-white/20 text-white rounded transition-colors"
-                aria-label="Zoom in"
-              >
-                <ZoomIn className="w-4 h-4" />
-              </button>
-            </div>
-          </div>
-        </div>
-
-        <div
-          ref={timelineContainerRef}
-          className="relative h-36 px-4 pb-4 overflow-hidden"
-          onWheel={handleWheel}
-        >
-          <div className="relative w-full h-full">
-            {timestamps.map((timestamp, index) => {
-              if (!isTimestampVisible(timestamp.time)) return null;
-
-              const position = getTimestampPosition(timestamp.time);
-              const opacity = getTimestampOpacity(timestamp.time);
-              const zIndex = getZIndex(index, timestamp.time);
-              const isHovered = hoveredTimestamp === index;
-
-              return (
-                <div
-                  key={index}
-                  className="absolute transition-all duration-200"
-                  style={{
-                    left: `${position}%`,
-                    transform: `translateX(-50%) ${isHovered ? 'scale(1.1) translateY(-8px)' : 'scale(1)'}`,
-                    opacity,
-                    zIndex,
-                  }}
-                  onMouseEnter={() => setHoveredTimestamp(index)}
-                  onMouseLeave={() => setHoveredTimestamp(null)}
-                  onClick={() => {
-                    setCurrentTime(timestamp.time);
-                    if (videoRef.current) {
-                      videoRef.current.currentTime = timestamp.time;
-                    }
-                  }}
-                >
-                  <div
-                    className={`bg-black/90 backdrop-blur-sm rounded-lg overflow-hidden cursor-pointer border-2 transition-all ${
-                      isHovered
-                        ? 'border-cyan-400 shadow-[0_0_20px_rgba(34,211,238,0.6)]'
-                        : 'border-white/20'
-                    }`}
-                  >
-                    <img
-                      src={timestamp.thumbnail}
-                      alt={timestamp.description}
-                      className="w-24 h-14 object-cover"
-                    />
-                    <div className="px-2 py-1.5 space-y-0.5">
-                      <p className="text-cyan-400 text-xs font-mono">
-                        {formatTime(timestamp.time)}
-                      </p>
-                      <p className="text-white/90 text-xs leading-tight">
-                        {timestamp.description}
-                      </p>
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
         </div>
       </div>
     </div>

@@ -490,6 +490,12 @@
 /* ---------- About page ---------- */
 .about-page {
   width: 100%;
+  /* Tighter than the default .page padding so the 2x2 grid fits viewport. */
+  padding-block: clamp(20px, 3vw, 40px);
+}
+
+.about-page .page-head {
+  margin-bottom: clamp(18px, 2.4vw, 28px);
 }
 
 .team-grid {
@@ -497,7 +503,7 @@
   z-index: 2;
   display: grid;
   grid-template-columns: repeat(2, 1fr);
-  gap: clamp(16px, 2.4vw, 28px);
+  gap: clamp(14px, 2vw, 22px);
   max-width: 1100px;
 }
 
@@ -505,8 +511,8 @@
   position: relative;
   background: var(--bg-card);
   border: 1px solid var(--border);
-  border-radius: 16px;
-  padding: 28px;
+  border-radius: 14px;
+  padding: 20px 22px;
   box-shadow: var(--shadow-card);
   overflow: hidden;
   opacity: 0;
@@ -549,48 +555,84 @@
 }
 
 .person-avatar {
-  width: 76px;
-  height: 76px;
+  position: relative;
+  width: 64px;
+  height: 64px;
   border-radius: 50%;
-  background: radial-gradient(
-    circle at 35% 35%,
-    rgba(244, 236, 216, 0.08) 0%,
-    rgba(74, 141, 184, 0.12) 60%,
-    transparent 100%
-  );
+  background-color: transparent;
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
   border: 1px solid var(--border-soft);
   color: var(--foam);
   display: flex;
   align-items: center;
   justify-content: center;
-  margin-bottom: 18px;
+  margin-bottom: 12px;
+  padding: 0;
+  cursor: pointer;
+  overflow: hidden;
   transition:
     border-color 0.25s ease,
-    background 0.25s ease;
+    background-color 0.25s ease,
+    transform 0.25s ease;
+}
+
+/* Default background tint — only when no photo is set */
+.person-avatar:not([style*="background-image"]) {
+  background:
+    radial-gradient(
+      circle at 35% 35%,
+      rgba(244, 236, 216, 0.08) 0%,
+      rgba(74, 141, 184, 0.12) 60%,
+      transparent 100%
+    );
+  border-color: var(--border-soft);
 }
 
 .person-card:hover .person-avatar {
   border-color: var(--sand-border);
-  background: radial-gradient(
-    circle at 35% 35%,
-    rgba(217, 164, 65, 0.15) 0%,
-    rgba(74, 141, 184, 0.1) 60%,
-    transparent 100%
-  );
+}
+
+.person-avatar:hover {
+  transform: scale(1.03);
+}
+
+.person-avatar:focus-visible {
+  outline: 2px solid var(--sand);
+  outline-offset: 2px;
 }
 
 .person-initials {
   font-family: var(--heading);
-  font-size: 1.6rem;
+  font-size: 1.4rem;
   font-weight: 500;
   letter-spacing: 0.02em;
   color: var(--sand);
   font-style: italic;
 }
 
+/* Camera-icon overlay — fades in on hover so the circle reads as "click to upload" */
+.person-avatar-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(10, 17, 40, 0.65);
+  color: var(--foam);
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+
+.person-avatar:hover .person-avatar-overlay,
+.person-avatar:focus-visible .person-avatar-overlay {
+  opacity: 1;
+}
+
 .person-name {
   font-family: var(--heading);
-  font-size: 1.3rem;
+  font-size: 1.2rem;
   font-weight: 500;
   color: var(--foam);
   margin: 0 0 4px;
@@ -598,16 +640,16 @@
 
 .person-role {
   font-family: var(--mono);
-  font-size: 12px;
-  letter-spacing: 1.5px;
+  font-size: 11px;
+  letter-spacing: 1.4px;
   text-transform: uppercase;
   color: var(--sand);
-  margin: 0 0 12px;
+  margin: 0 0 10px;
 }
 
 .person-desc {
-  font-size: 0.95rem;
-  line-height: 1.55;
+  font-size: 0.92rem;
+  line-height: 1.5;
   color: var(--text);
 }
 
