@@ -10,11 +10,13 @@ import re
 import shutil
 import subprocess
 import imageio_ffmpeg
-import supervision as sv
-import pymongo
+
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
+import basketball_cv.run_model as run_model
+from db import fetch_shots, replace_video_session
+
 
 # Load .env BEFORE reading any environment variables.
 load_dotenv(Path(__file__).parent / ".env")
@@ -35,9 +37,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-UPLOAD_DIR = Path("uploads")
+BASE_DIR = Path(__file__).resolve().parent
+UPLOAD_DIR = BASE_DIR / "Uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-ANNOTATED_DIR = Path("Annotated")
+ANNOTATED_DIR = BASE_DIR / "Annotated"
 ANNOTATED_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -226,6 +229,11 @@ async def video_timestamps(duration: float):
     return _placeholder_timestamps(duration)
 
 
+@app.get("/api/shots")
+async def get_shots():
+    return fetch_shots()
+
+
 @app.post("/videoUpload")
 async def videoUpload(
     file: Annotated[UploadFile, File(...)],
@@ -236,8 +244,15 @@ async def videoUpload(
         raise HTTPException(status_code=415, detail="Unsupported Media Type")
 
     ext = Path(file.filename or "").suffix.lower()
-    filename = f"video{ext}"
+    filename = f"input{ext}"
     dest = UPLOAD_DIR / filename
+    outputFilename = f"output{ext}"
+    annotated_dest = ANNOTATED_DIR / outputFilename
+
+    if dest.exists():
+        dest.unlink()
+    if annotated_dest.exists():
+        annotated_dest.unlink()
 
     with dest.open("wb") as buffer:
         while chunk := await file.read(1024 * 1024):
@@ -245,24 +260,20 @@ async def videoUpload(
 
     await file.close()
 
-    # ------------------------------------------------------------------
-    # DEMO BRIDGE — until the CV pipeline is wired in.
-    # Transcode the raw upload into a web-playable H.264/AAC mp4 and put
-    # the result in Annotated/. Browsers refuse anything other than H.264
-    # (FMP4/XviD, HEVC, ProRes, etc. all fail silently), so this step is
-    # required even once real annotation lands — unless the CV pipeline
-    # already emits H.264. Fallback to raw copy if ffmpeg blows up, so
-    # the player at least has something to try.
-    # ------------------------------------------------------------------
-    annotated_dest = ANNOTATED_DIR / filename
-    if not _transcode_to_h264(dest, annotated_dest):
-        shutil.copy2(dest, annotated_dest)
+    shots = run_model.run_model(str(dest), str(annotated_dest))
+    shot_count = replace_video_session(
+        shots,
+        source_video=dest.name,
+        annotated_video=annotated_dest.name,
+    )
 
     return {
         "message": "uploaded",
         "title": title,
         "original_filename": filename,
-        "stored_as": filename,
+        "stored_as": dest.name,
+        "annotated_filename": annotated_dest.name,
+        "shots_stored": shot_count,
         "content_type": file.content_type,
     }
 
