@@ -1,27 +1,27 @@
 const TEAM = [
   {
-    name: 'Alex Rivera',
+    name: 'Andrew Nguyen',
     role: 'Computer Vision Lead',
     description:
-      'Drives the on-court detection and tracking models that turn raw footage into structured play data.',
+      'Plays ball.',
   },
   {
-    name: 'Jordan Chen',
+    name: 'Noah Scott',
     role: 'Machine Learning Engineer',
     description:
-      'Trains and evaluates the player-identification and shot-classification pipelines on real game film.',
+      'Fetches ball.',
   },
   {
     name: 'Sam Park',
     role: 'Full-stack Developer',
     description:
-      'Builds the product surface — uploads, dashboards, and the query interface that make the models usable.',
+      'Knows ball.',
   },
   {
     name: 'Taylor Kim',
     role: 'Product & Design',
     description:
-      'Owns the deep-sea aesthetic and the end-to-end coach-facing experience, from landing page to analysis view.',
+      'Ball...',
   },
 ]
 
