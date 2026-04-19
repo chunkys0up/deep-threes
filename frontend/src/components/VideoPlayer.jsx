@@ -543,7 +543,7 @@ export default function VideoPlayer({
                     }}
                   >
                     <div
-                      className={`bg-black/90 backdrop-blur-sm rounded-lg overflow-hidden cursor-pointer border-2 transition-all ${
+                      className={`w-24 bg-black/90 backdrop-blur-sm rounded-lg overflow-hidden cursor-pointer border-2 transition-all ${
                         isHovered
                           ? 'border-cyan-400 shadow-[0_0_20px_rgba(34,211,238,0.6)]'
                           : 'border-white/20'
@@ -552,13 +552,13 @@ export default function VideoPlayer({
                       <img
                         src={timestamp.thumbnail}
                         alt={timestamp.description}
-                        className="w-24 h-14 object-cover"
+                        className="h-14 object-cover"
                       />
                       <div className="px-2 py-1.5 space-y-0.5">
                         <p className="text-cyan-400 text-xs font-mono">
                           {formatTime(timestamp.time)}
                         </p>
-                        <p className="text-white/90 text-xs leading-tight">
+                        <p className="text-white/90 text-xs leading-tight truncate">
                           {timestamp.description}
                         </p>
                       </div>
