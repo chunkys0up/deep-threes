@@ -58,46 +58,7 @@ def run_model(
     target = Path(target_video_path)
 
     video_info = sv.VideoInfo.from_video_path(str(source))
-    team_classifier, fit_crops = fit_team_classifier(CLIENT)
-
-    detected_team_names = identify_nba_teams(
-        team_classifier, fit_crops, fallback=TEAM_NAMES
-    )
-    team_names = {**TEAM_NAMES, **detected_team_names, **caller_overrides}
-    print(f"[run_model] team_names resolved to: {team_names}")
-
-    # Build a dynamic color palette for shot-result overlays that matches the
-    # detected teams' brand colors (Celtics green for cluster 0, Knicks blue
-    # for cluster 1, etc.). Falls back to the original green/blue defaults if
-    # no NBA match is found. This is what paints the "5 ft (Paint)" pill on
-    # top of made shots — having it follow the real team means you see green
-    # on a Celtics shot regardless of which cluster they were classified as.
-    def _team_hex(team_name: str, default: str) -> str:
-        match = next((t for t in NBA_TEAMS if t["name"] == team_name), None)
-        return match["hex"] if match else default
-
-    team_0_hex = _team_hex(team_names.get(0, ""), "#007A33")  # Celtics green
-    team_1_hex = _team_hex(team_names.get(1, ""), "#006BB6")  # Knicks blue
-    made_palette = sv.ColorPalette.from_hex([team_0_hex, team_1_hex])
-    print(
-        f"[run_model] shot overlay palette: 0={team_0_hex} ({team_names.get(0)}), "
-        f"1={team_1_hex} ({team_names.get(1)})"
-    )
-
-    triangle_annotator = sv.TriangleAnnotator(
-        color=made_palette,
-        base=25,
-        height=21,
-        color_lookup=sv.ColorLookup.CLASS,
-    )
-    text_annotator = sv.RichLabelAnnotator(
-        font_size=60,
-        color=made_palette,
-        text_color=TEXT_COLOR,
-        text_offset=(0, -30),
-        color_lookup=sv.ColorLookup.CLASS,
-        text_position=sv.Position.TOP_CENTER,
-    )
+    team_classifier = fit_team_classifier(CLIENT, source_video_path=source)
     byte_tracker = sv.ByteTrack(frame_rate=30)
     number_validator = init_number_validator()
     shot_event_tracker = ShotEventTracker(
@@ -176,23 +137,26 @@ def run_model(
             player_detections.data["team_id"] = np.array([])
 
         # 3. Jersey number recognition every 5 frames
-        if index % 5 == 0:
+        if True:
             recognize_jersey_numbers(frame, player_detections, number_validator, CLIENT)
 
         # 4. Court detection + view transformers
-        # Court inference occasionally 524s on Roboflow's serverless endpoint.
-        # When it does, we skip this frame's keypoint update — the smoother
-        # still holds the previous frame's keypoints — and set
-        # `have_enough_points = False` so shot-location math is skipped too.
-        court_result = infer_with_retry(CLIENT, frame, COURT_DETECTION_MODEL_ID)
+        court_result = CLIENT.infer(frame, model_id=COURT_DETECTION_MODEL_ID)
+        key_points = sv.KeyPoints.from_inference(court_result)
         image_to_court = None
         court_to_image = None
         have_enough_points = False
 
-        if court_result is not None:
-            key_points = sv.KeyPoints.from_inference(court_result)
+        if key_points.xy.ndim == 3 and key_points.xy.shape[0] > 0:
+            if key_points.xy.shape[0] > 1:
+                key_points.xy = key_points.xy[:1]
+                if key_points.confidence is not None:
+                    key_points.confidence = key_points.confidence[:1]
+
             key_points.xy = smoother.update(
-                xy=key_points.xy, confidence=key_points.confidence, conf_threshold=0.5
+                xy=key_points.xy,
+                confidence=key_points.confidence,
+                conf_threshold=0.5,
             )
 
             key_mask = key_points.confidence[0] > KEYPOINT_CONFIDENCE_THRESHOLD
@@ -218,20 +182,54 @@ def run_model(
             missed_events = [e for e in events if e["event"] == "MISSED"]
 
             if start_events:
-                shot_player_detections = player_detections[
+                shot_action_detections = player_detections[
                     (player_detections.class_id == JUMP_SHOT_CLASS_ID)
                     | (player_detections.class_id == LAYUP_DUNK_CLASS_ID)
                 ]
-                anchors_image = shot_player_detections.get_anchors_coordinates(
+                action_anchors_image = shot_action_detections.get_anchors_coordinates(
                     anchor=sv.Position.BOTTOM_CENTER
                 )
-                if len(anchors_image) > 0:
-                    anchors_court = image_to_court.transform_points(points=anchors_image)
+
+                if len(action_anchors_image) > 0:
+                    action_index = 0
+                    if len(shot_action_detections.confidence) > 0:
+                        action_index = int(np.argmax(shot_action_detections.confidence))
+
+                    action_anchor_image = action_anchors_image[action_index]
+
+                    player_body_detections = player_detections[
+                        (player_detections.class_id != JUMP_SHOT_CLASS_ID)
+                        & (player_detections.class_id != LAYUP_DUNK_CLASS_ID)
+                    ]
+                    player_body_anchors = player_body_detections.get_anchors_coordinates(
+                        anchor=sv.Position.BOTTOM_CENTER
+                    )
+
+                    anchor_image_for_shot = action_anchor_image
+                    tracker_id_for_shot: Optional[int] = None
+
+                    if len(player_body_anchors) > 0:
+                        distances = np.linalg.norm(
+                            player_body_anchors - action_anchor_image,
+                            axis=1,
+                        )
+                        player_index = int(np.argmin(distances))
+                        anchor_image_for_shot = player_body_anchors[player_index]
+                        if len(player_body_detections.tracker_id) > player_index:
+                            tracker_id_for_shot = int(
+                                player_body_detections.tracker_id[player_index]
+                            )
+
+                    if tracker_id_for_shot is None and len(shot_action_detections.tracker_id) > action_index:
+                        tracker_id_for_shot = int(
+                            shot_action_detections.tracker_id[action_index]
+                        )
+
+                    anchors_court = image_to_court.transform_points(
+                        points=np.asarray([anchor_image_for_shot])
+                    )
                     shot_in_progress_xy = anchors_court[0]
-                    if len(shot_player_detections.tracker_id) > 0:
-                        player_tracker_id_for_shot = int(shot_player_detections.tracker_id[0])
-                    else:
-                        player_tracker_id_for_shot = None
+                    player_tracker_id_for_shot = tracker_id_for_shot
 
             for result, event_list in ((True, made_events), (False, missed_events)):
                 if event_list and shot_in_progress_xy is not None and player_tracker_id_for_shot is not None:
@@ -295,21 +293,37 @@ def run_model(
         # 6. Annotation
         annotated_frame = frame.copy()
 
-        if len(player_detections) > 0:
+        annotated_player_detections = player_detections[
+            player_detections.confidence >= PLAYER_ANNOTATION_CONFIDENCE_THRESHOLD
+        ]
+
+        if len(annotated_player_detections) > 0:
             validated_numbers = number_validator.get_validated(
-                tracker_ids=player_detections.tracker_id
+                tracker_ids=annotated_player_detections.tracker_id
             )
             player_labels = []
             for i, num in enumerate(validated_numbers):
-                team_id = int(player_detections.data["team_id"][i])
-                team_name = team_names.get(team_id, "Unknown")
+                team_id = int(annotated_player_detections.data["team_id"][i])
+                team_name = TEAM_NAMES.get(team_id, "Unknown")
                 display_num = f"#{num}" if num not in (None, "") else ""
                 player_labels.append(f"{display_num} {team_name}".strip())
 
-            team_0_detections = player_detections[player_detections.data["team_id"] == 0]
-            team_1_detections = player_detections[player_detections.data["team_id"] == 1]
-            team_0_labels = [player_labels[i] for i in range(len(player_detections)) if player_detections.data["team_id"][i] == 0]
-            team_1_labels = [player_labels[i] for i in range(len(player_detections)) if player_detections.data["team_id"][i] == 1]
+            team_0_detections = annotated_player_detections[
+                annotated_player_detections.data["team_id"] == 0
+            ]
+            team_1_detections = annotated_player_detections[
+                annotated_player_detections.data["team_id"] == 1
+            ]
+            team_0_labels = [
+                player_labels[i]
+                for i in range(len(annotated_player_detections))
+                if annotated_player_detections.data["team_id"][i] == 0
+            ]
+            team_1_labels = [
+                player_labels[i]
+                for i in range(len(annotated_player_detections))
+                if annotated_player_detections.data["team_id"][i] == 1
+            ]
 
             annotated_frame = team_0_annotator.annotate(scene=annotated_frame, detections=team_0_detections, labels=team_0_labels)
             annotated_frame = team_1_annotator.annotate(scene=annotated_frame, detections=team_1_detections, labels=team_1_labels)

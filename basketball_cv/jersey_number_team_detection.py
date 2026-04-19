@@ -1,6 +1,7 @@
 import numpy as np
 import supervision as sv
 from tqdm import tqdm
+from pathlib import Path
 from typing import List, Tuple
 
 from sports import ConsecutiveValueTracker, TeamClassifier
@@ -14,6 +15,7 @@ from .config import (
     PLAYER_DETECTION_MODEL_IOU_THRESHOLD,
     STRIDE,
     SOURCE_VIDEO_DIRECTORY,
+    TEAM_CLASSIFIER_MAX_FRAMES,
 )
 
 def coords_above_threshold(
@@ -26,50 +28,45 @@ def coords_above_threshold(
     return pairs
 
 
-def fit_team_classifier(client) -> Tuple[TeamClassifier, List[np.ndarray]]:
-    """Fit the two-cluster jersey classifier and return it alongside the crops
-    it was trained on. The crops are reused downstream to guess which NBA
-    team each cluster corresponds to via color matching."""
+def fit_team_classifier(client, source_video_path: str | Path | None = None) -> TeamClassifier:
     crops = []
+    processed_frames = 0
 
-    for video_path in sv.list_files_with_extensions(SOURCE_VIDEO_DIRECTORY, extensions=["mp4", "avi", "mov"]):
+    if source_video_path is not None:
+        video_paths = [str(Path(source_video_path))]
+    else:
+        video_paths = sv.list_files_with_extensions(
+            SOURCE_VIDEO_DIRECTORY,
+            extensions=["mp4", "avi", "mov"],
+        )
+
+    for video_path in video_paths:
         frame_generator = sv.get_video_frames_generator(source_path=video_path, stride=STRIDE)
 
         for frame in tqdm(frame_generator):
-            result = infer_with_retry(client, frame, PLAYER_DETECTION_MODEL_ID)
-            if result is None:
-                # Skip this training frame entirely — fitting survives losing a few.
-                continue
+            if processed_frames >= TEAM_CLASSIFIER_MAX_FRAMES:
+                break
+
+            result = client.infer(frame, model_id=PLAYER_DETECTION_MODEL_ID)
             detections = sv.Detections.from_inference(result)
             detections = detections.with_nms(threshold=PLAYER_DETECTION_MODEL_IOU_THRESHOLD, class_agnostic=True)
             detections = detections[detections.confidence > PLAYER_DETECTION_MODEL_CONFIDENCE]
             detections = detections[np.isin(detections.class_id, PLAYER_CLASS_IDS)]
+            frame_h, frame_w = frame.shape[:2]
+            boxes = sv.clip_boxes(detections.xyxy, resolution_wh=(frame_w, frame_h))
 
-            # Shrink each player bbox to 40% of its original size before
-            # cropping — the resulting patch is jersey+shorts only, no floor
-            # or head or referees, which makes the TeamClassifier's embedding
-            # space much cleaner. Mirrors the reference Colab; predict-time
-            # crops are deliberately left full-size (see classify_teams and
-            # run_model.py callback).
-            boxes = sv.scale_boxes(xyxy=detections.xyxy, factor=0.4)
+            for xyxy in boxes:
+                crop = sv.crop_image(frame, xyxy)
+                if crop is not None and crop.size > 0 and crop.shape[0] > 0 and crop.shape[1] > 0:
+                    crops.append(crop)
 
-            # Filter out zero-area / empty crops before feeding the team
-            # classifier — cv2.cvtColor raises on empty input and kills the run.
-            for box in boxes:
-                crop = sv.crop_image(frame, box)
-                if crop is None:
-                    continue
-                if getattr(crop, "size", 0) == 0:
-                    continue
-                if crop.shape[0] < 2 or crop.shape[1] < 2:
-                    continue
-                crops.append(crop)
+            processed_frames += 1
+
+        if processed_frames >= TEAM_CLASSIFIER_MAX_FRAMES:
+            break
 
     if not crops:
-        raise RuntimeError(
-            "Team classifier found no usable player crops — upload may have "
-            "no visible players or detection confidence is too high."
-        )
+        raise RuntimeError("No valid player crops found for team classification.")
 
     team_classifier = TeamClassifier(device="cpu")
     team_classifier.fit(crops)

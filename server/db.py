@@ -17,8 +17,8 @@ SESSION_COLLECTION_NAME = os.environ.get("MONGO_SESSION_COLLECTION", "session")
 ROSTER_COLLECTION_NAME = os.environ.get("MONGO_ROSTER_COLLECTION", "roster")
 GALLERY_COLLECTION_NAME = os.environ.get("MONGO_GALLERY_COLLECTION", "gallery_sessions")
 
-# Short timeout so requests don't block for 30s when Mongo isn't running.
-client = pymongo.MongoClient(MONGO_URI, serverSelectionTimeoutMS=1500)
+
+client = pymongo.MongoClient(MONGO_URI)
 database = client[MONGO_DB_NAME]
 shots_collection = database[SHOTS_COLLECTION_NAME]
 session_collection = database[SESSION_COLLECTION_NAME]

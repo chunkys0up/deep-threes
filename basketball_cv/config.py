@@ -26,6 +26,7 @@ SHOT_CLASS_ID = 5
 KEYPOINT_CONFIDENCE_THRESHOLD = 0.5
 DETECTION_CONFIDENCE = 0.3
 PLAYER_DETECTION_MODEL_CONFIDENCE = 0.3
+PLAYER_ANNOTATION_CONFIDENCE_THRESHOLD = 0.6
 PLAYER_DETECTION_MODEL_IOU_THRESHOLD = 0.7
 
 # Player class IDs: player, player-in-possession, player-jump-shot, player-layup-dunk, player-shot-block
@@ -36,6 +37,7 @@ JUMP_SHOT_MIN_CONSECUTIVE_FRAMES = 3
 LAYUP_DUNK_MIN_CONSECUTIVE_FRAMES = 3
 
 STRIDE = 30
+TEAM_CLASSIFIER_MAX_FRAMES = 40
 
 # Court config
 CONFIG = CourtConfiguration(league=League.NBA, measurement_unit=MeasurementUnit.FEET)
