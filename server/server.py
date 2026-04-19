@@ -168,12 +168,15 @@ def _transcode_to_h264(src: Path, dst: Path) -> bool:
 
 
 def _placeholder_timestamps(duration: float) -> list[dict]:
-    if duration < len(DEFAULT_EVENTS):
-        duration = float(len(DEFAULT_EVENTS))
+    # Distribute events evenly inside the actual video duration so every event
+    # position stays inside [0, 100%] for the scrubber — no more half-clipped
+    # thumbnails on the right edge.
+    if duration <= 0:
+        duration = 120.0
     step = duration / (len(DEFAULT_EVENTS) + 1)
     return [
         {
-            "time": round((i + 1) * step, 1),
+            "time": round((i + 1) * step, 2),
             "description": DEFAULT_EVENTS[i],
             "thumbnail": f"https://picsum.photos/seed/{i + 1}/120/68",
         }

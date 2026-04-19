@@ -7,11 +7,11 @@ export default function VideoPlayerPage() {
 
   return (
     <div
-      className={`h-full flex gap-4 p-4 bg-[#0a1128] ${
+      className={`flex-1 min-h-0 overflow-hidden flex gap-4 p-4 bg-[#0a1128] ${
         theaterMode ? 'theater' : ''
       }`}
     >
-      <div className="flex-1 flex items-center min-w-0">
+      <div className="flex-1 min-w-0 min-h-0 flex items-center">
         <VideoPlayer
           isTheaterMode={theaterMode}
           onTheaterToggle={() => setTheaterMode((t) => !t)}
@@ -19,7 +19,7 @@ export default function VideoPlayerPage() {
       </div>
 
       {!theaterMode && (
-        <div className="w-80 flex-shrink-0 h-full">
+        <div className="w-80 flex-shrink-0 h-full min-h-0">
           <Chatbot />
         </div>
       )}
