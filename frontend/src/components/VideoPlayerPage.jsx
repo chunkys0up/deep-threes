@@ -6,28 +6,23 @@ export default function VideoPlayerPage() {
   const [theaterMode, setTheaterMode] = useState(false)
 
   return (
-    <div className={`page player-page ${theaterMode ? 'theater' : ''}`}>
-      <div className="page-head">
-        <span className="section-eyebrow">Film room</span>
-        <h1 className="page-title">
-          Annotated <em>footage</em>
-        </h1>
-        <p className="page-tag">
-          Upload a clip and the CV pipeline surfaces timestamped events — then
-          ask the AI assistant anything about the possession.
-        </p>
+    <div
+      className={`h-full flex gap-4 p-4 bg-[#0a1128] ${
+        theaterMode ? 'theater' : ''
+      }`}
+    >
+      <div className="flex-1 flex items-center min-w-0">
+        <VideoPlayer
+          isTheaterMode={theaterMode}
+          onTheaterToggle={() => setTheaterMode((t) => !t)}
+        />
       </div>
 
-      <div className="player-stage">
-        <div className="player-stage-inner">
-          <VideoPlayer
-            isTheaterMode={theaterMode}
-            onTheaterToggle={() => setTheaterMode((t) => !t)}
-          />
+      {!theaterMode && (
+        <div className="w-80 flex-shrink-0 h-full">
+          <Chatbot />
         </div>
-      </div>
-
-      {!theaterMode && <Chatbot />}
+      )}
     </div>
   )
 }

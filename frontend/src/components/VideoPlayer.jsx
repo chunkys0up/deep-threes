@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import { Play, Pause, Volume2, VolumeX, Maximize, Minimize, ZoomIn, ZoomOut, X, AlertTriangle } from "lucide-react";
 
 const API_BASE_URL = "http://localhost:8000";
@@ -57,11 +57,29 @@ export default function VideoPlayer({ isTheaterMode = false, onTheaterToggle }) 
   const containerRef = useRef(null);
   const controlsTimeoutRef = useRef(null);
   const timelineContainerRef = useRef(null);
+  const seekBarWrapperRef = useRef(null);
   const fileInputRef = useRef(null);
 
   useEffect(() => {
     fetchVideoInfo();
   }, []);
+
+  // ─── FIX 2: Attach non-passive wheel listeners so preventDefault() actually works ───
+  // React attaches onWheel as a passive listener by default, which silently ignores
+  // e.preventDefault(), letting the page scroll through. We attach native listeners
+  // with { passive: false } on both the seek-bar wrapper and the events timeline so
+  // the browser honours our scroll interception.
+  useEffect(() => {
+    const elements = [timelineContainerRef.current, seekBarWrapperRef.current];
+    const cleanups = elements.map((el) => {
+      if (!el) return () => {};
+      const handler = (e) => handleWheel(e);
+      el.addEventListener("wheel", handler, { passive: false });
+      return () => el.removeEventListener("wheel", handler);
+    });
+    return () => cleanups.forEach((fn) => fn());
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [zoomLevel, scrollPosition, currentTime, duration]);
 
   const fetchVideoInfo = async () => {
     try {
@@ -188,6 +206,17 @@ export default function VideoPlayer({ isTheaterMode = false, onTheaterToggle }) 
     }
   };
 
+  // ─── FIX 1: Seek bar window helpers ───────────────────────────────────────────
+  // Derive the visible time window from zoomLevel + scrollPosition so that both
+  // the seek bar and the progress fill only represent the zoomed slice.
+  const maxDuration = duration || 120;
+  const windowSize = maxDuration / zoomLevel;
+  const centerTime = scrollPosition * maxDuration;
+  const windowStart = Math.max(0, Math.min(centerTime - windowSize / 2, maxDuration - windowSize));
+  const windowEnd = windowStart + windowSize;
+  const clampedCurrentTime = Math.min(Math.max(currentTime, windowStart), windowEnd);
+  const progressPercent = ((clampedCurrentTime - windowStart) / (windowEnd - windowStart)) * 100;
+
   const handleTimelineChange = (e) => {
     const newTime = parseFloat(e.target.value);
     setCurrentTime(newTime);
@@ -196,7 +225,6 @@ export default function VideoPlayer({ isTheaterMode = false, onTheaterToggle }) 
     }
 
     if (zoomLevel > 1) {
-      const maxDuration = duration || 120;
       setScrollPosition(newTime / maxDuration);
     }
   };
@@ -255,32 +283,23 @@ export default function VideoPlayer({ isTheaterMode = false, onTheaterToggle }) 
   };
 
   const handleWheel = (e) => {
-    e.preventDefault();
+    e.preventDefault(); // Now actually works — listener is non-passive (Fix 2)
     if (e.ctrlKey || e.metaKey) {
       const delta = -e.deltaY * 0.01;
       const newZoom = Math.max(1, Math.min(10, zoomLevel + delta));
       setZoomLevel(newZoom);
 
       if (newZoom > 1) {
-        const maxDuration = duration || 120;
         const mousePositionRatio = currentTime / maxDuration;
         setScrollPosition(mousePositionRatio);
       }
     } else {
       const newScroll = Math.max(0, Math.min(1, scrollPosition + e.deltaY * 0.001));
       setScrollPosition(newScroll);
-
-      if (zoomLevel > 1) {
-        const maxDuration = duration || 120;
-        const centerTime = newScroll * maxDuration;
-        if (videoRef.current && Math.abs(centerTime - currentTime) > maxDuration * 0.1) {
-        }
-      }
     }
   };
 
   const getTimestampPosition = (time) => {
-    const maxDuration = duration || 120;
     const basePosition = (time / maxDuration) * 100;
     const centerTime = scrollPosition * maxDuration;
     const centerPosition = 50;
@@ -339,6 +358,14 @@ export default function VideoPlayer({ isTheaterMode = false, onTheaterToggle }) 
   if (!hasVideo) {
     return (
       <div className="w-full bg-[#0a1128] rounded-2xl overflow-hidden border border-[#1b3a6b] shadow-[0_20px_60px_-20px_rgba(0,0,0,0.7)]">
+        {/* ─── FIX 4: Compact single-line header ──────────────────────────────── */}
+        <div className="px-5 py-2.5 flex items-center gap-3 border-b border-[#1b3a6b]">
+          <span className="text-[#f4ecd8] font-semibold text-sm tracking-wide" style={{ fontFamily: 'var(--heading)' }}>
+            Film Room
+          </span>
+          <span className="text-[#7a89a8] text-xs">AI-powered play-by-play event timeline</span>
+        </div>
+
         <div
           onDragOver={handleDragOver}
           onDragLeave={handleDragLeave}
@@ -402,7 +429,7 @@ export default function VideoPlayer({ isTheaterMode = false, onTheaterToggle }) 
   return (
     <div
       ref={containerRef}
-      className="w-full bg-black rounded-2xl overflow-hidden border border-[#1b3a6b] shadow-[0_20px_60px_-20px_rgba(0,0,0,0.7)]"
+      className="w-full h-full flex flex-col bg-black rounded-2xl overflow-hidden border border-[#1b3a6b] shadow-[0_20px_60px_-20px_rgba(0,0,0,0.7)]"
       onMouseMove={handleMouseMove}
       onMouseLeave={() => isPlaying && setShowControls(false)}
     >
@@ -411,10 +438,11 @@ export default function VideoPlayer({ isTheaterMode = false, onTheaterToggle }) 
           {error}
         </div>
       )}
-      <div className="relative">
+
+      <div className="relative flex-1 min-h-0 flex flex-col">
         <video
           ref={videoRef}
-          className="w-full aspect-video bg-black"
+          className="w-full h-full object-contain bg-black"
           onClick={togglePlay}
           onTimeUpdate={handleTimeUpdate}
           onLoadedMetadata={handleLoadedMetadata}
@@ -456,6 +484,17 @@ export default function VideoPlayer({ isTheaterMode = false, onTheaterToggle }) 
       </div>
 
       <div className="bg-gradient-to-b from-[#1a1a3e]/90 to-[#0a0a1f]/90 backdrop-blur-sm border-t border-white/10">
+
+        {/* ─── FIX 4: Compact single-line header ──────────────────────────────── */}
+        {/* Replaces a stacked title + description block. Saves a full line of     */}
+        {/* vertical space so users don't have to scroll to reach the controls.    */}
+        <div className="px-4 pt-2.5 pb-1.5 flex items-center gap-3 border-b border-white/10">
+          <span className="text-white font-semibold text-sm tracking-wide" style={{ fontFamily: 'var(--heading)' }}>
+            Film Room
+          </span>
+          <span className="text-white/40 text-xs truncate">AI-powered play-by-play event timeline</span>
+        </div>
+
         <div className="p-4 flex items-center justify-between text-white">
           <div className="flex items-center gap-3">
             <button
@@ -489,8 +528,14 @@ export default function VideoPlayer({ isTheaterMode = false, onTheaterToggle }) 
               />
             </div>
 
+            {/* ─── FIX 1: Show zoomed window timestamps instead of full duration ── */}
+            {/* Before: always showed 0:00 / {duration}                              */}
+            {/* After: shows windowStart..windowEnd when zoomed in                   */}
             <span className="text-sm">
-              {formatTime(currentTime)} / {formatTime(duration || 120)}
+              {formatTime(currentTime)} /{" "}
+              {zoomLevel > 1
+                ? `${formatTime(windowStart)}–${formatTime(windowEnd)}`
+                : formatTime(maxDuration)}
             </span>
           </div>
 
@@ -512,25 +557,37 @@ export default function VideoPlayer({ isTheaterMode = false, onTheaterToggle }) 
           </div>
         </div>
 
+        {/* ─── FIX 1 & 2: Seek bar — zoom-aware window + non-passive wheel ──── */}
+        {/* The wrapper div gets a ref so we can attach a { passive: false }       */}
+        {/* wheel listener in useEffect, allowing e.preventDefault() to work.      */}
+        {/* min/max are now windowStart/windowEnd instead of 0/duration so the     */}
+        {/* scrubber thumb only travels across the visible zoomed window.          */}
         <div className="px-4 pb-2">
           <div className="flex items-center gap-3">
-            <div className="flex-1 relative" onWheel={handleWheel}>
+            {/* Attach ref here so the non-passive listener covers the seek bar */}
+            <div className="flex-1 relative" ref={seekBarWrapperRef}>
               <div className="relative">
                 <input
                   type="range"
-                  min="0"
-                  max={duration || 120}
-                  value={currentTime}
+                  min={windowStart}
+                  max={windowEnd}
+                  step={0.01}
+                  value={clampedCurrentTime}
                   onChange={handleTimelineChange}
                   className="relative z-10 w-full h-1.5 bg-transparent rounded-full appearance-none cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-cyan-400 [&::-webkit-slider-thumb]:cursor-pointer [&::-webkit-slider-thumb]:shadow-[0_0_8px_rgba(34,211,238,0.8)] hover:[&::-webkit-slider-thumb]:scale-125 [&::-webkit-slider-thumb]:transition-transform [&::-webkit-slider-thumb]:relative [&::-webkit-slider-thumb]:z-20"
                 />
                 <div className="absolute top-0 left-0 right-0 h-1.5 bg-white/20 rounded-full pointer-events-none">
+                  {/* Progress fill: now driven by progressPercent (zoom-relative) */}
                   <div
                     className="absolute h-full bg-cyan-400/50 rounded-full transition-all"
-                    style={{ width: `${(currentTime / (duration || 120)) * 100}%` }}
+                    style={{ width: `${progressPercent}%` }}
                   />
                 </div>
 
+                {/* ─── FIX 3: Tick marks — add -translate-x-1/2 for true centering ── */}
+                {/* Before: left: `${position}%` with no horizontal transform,          */}
+                {/* causing the tick's left edge (not center) to sit at that position.  */}
+                {/* After: -translate-x-1/2 makes the tick's midpoint sit at position% */}
                 {timestamps.map((timestamp, index) => {
                   const position = getTimestampPosition(timestamp.time);
                   const isVisible = isTimestampVisible(timestamp.time);
@@ -541,7 +598,7 @@ export default function VideoPlayer({ isTheaterMode = false, onTheaterToggle }) 
                   return (
                     <div
                       key={index}
-                      className="absolute top-1/2 -translate-y-1/2 pointer-events-none transition-all duration-200"
+                      className="absolute top-1/2 -translate-x-1/2 -translate-y-1/2 pointer-events-none transition-all duration-200"
                       style={{
                         left: `${position}%`,
                         opacity: opacity,
@@ -582,10 +639,11 @@ export default function VideoPlayer({ isTheaterMode = false, onTheaterToggle }) 
           </div>
         </div>
 
+        {/* Events timeline — non-passive wheel listener attached via useEffect */}
         <div
           ref={timelineContainerRef}
           className="relative h-36 px-4 pb-4 overflow-hidden"
-          onWheel={handleWheel}
+          // onWheel removed — handled by the native non-passive listener in useEffect (Fix 2)
         >
           <div className="relative w-full h-full">
             {timestamps.map((timestamp, index) => {
