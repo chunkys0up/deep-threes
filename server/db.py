@@ -14,6 +14,7 @@ MONGO_DB_NAME = os.environ.get("MONGO_DB_NAME", "deep_threes")
 SHOTS_COLLECTION_NAME = os.environ.get("MONGO_SHOTS_COLLECTION", "shots")
 SESSION_COLLECTION_NAME = os.environ.get("MONGO_SESSION_COLLECTION", "session")
 
+
 client = pymongo.MongoClient(MONGO_URI)
 database = client[MONGO_DB_NAME]
 shots_collection = database[SHOTS_COLLECTION_NAME]
