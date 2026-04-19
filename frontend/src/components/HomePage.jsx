@@ -1,4 +1,4 @@
-import logo from '../assets/logo.svg'
+import logo from '../assets/logo.png'
 import bgImage from '../assets/bg.png'
 
 // ... (wave path constants unchanged)
@@ -16,22 +16,30 @@ export default function HomePage({ onNavigate }) {
           {/* ... wave SVGs unchanged ... */}
         </div>
 
-        <div className="home-content">
-          <img className="home-logo" src={logo} alt="Deep Court Analytics" />
-          <h1 className="home-title">
-            Deep <em>Threes</em>
-          </h1>
-          <p className="home-tag">
-            NBA computer vision, deep as the sea. Upload game footage and
-            surface every possession, shot, and player track — automatically.
-          </p>
-          <button
-            type="button"
-            className="home-cta"
-            onClick={() => onNavigate?.('player')}
-          >
-            Launch film room <span aria-hidden="true">→</span>
-          </button>
+        <div className="home-hero">
+          <div className="home-content">
+            <h1 className="home-title">
+              Deep <em>Threes</em>
+            </h1>
+            <p className="home-tag">
+              NBA computer vision, deep as the sea. Upload game footage and
+              surface every possession, shot, and player track — automatically.
+            </p>
+            <button
+              type="button"
+              className="home-cta"
+              onClick={() => onNavigate?.('player')}
+            >
+              Launch film room <span aria-hidden="true">→</span>
+            </button>
+          </div>
+
+          <img
+            className="home-hero-logo"
+            src={logo}
+            alt="Deep 3s"
+            aria-hidden="true"
+          />
         </div>
       </div>
     </div>
