@@ -2,6 +2,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Optional, Literal
 import os
@@ -25,7 +26,9 @@ from google.genai import types as genai_types
 # NOTE: basketball_cv.run_model is imported LAZILY inside /videoUpload so the
 # server can still boot even when Roboflow SDK deps aren't installed yet.
 from db import (
+    clear_current_session,
     fetch_shots,
+    fetch_current_session,
     replace_video_session,
     get_roster,
     save_roster,
@@ -78,8 +81,25 @@ _THREE_POINT_DISTANCE_FT = 22.0
 def _find_annotated_video() -> Optional[Path]:
     if not ANNOTATED_DIR.exists():
         return None
+    current = ANNOTATED_DIR / "output.mp4"
+    if current.exists():
+        return current
     matches = sorted(ANNOTATED_DIR.glob("*.mp4"))
     return matches[0] if matches else None
+
+
+def _annotated_session_id(filename: str) -> str:
+    return f"annotated:{filename}"
+
+
+def _annotated_filename_from_session_id(session_id: str) -> str | None:
+    prefix = "annotated:"
+    if not session_id.startswith(prefix):
+        return None
+    filename = session_id[len(prefix):]
+    if not filename or "/" in filename or "\\" in filename:
+        return None
+    return filename
 
 
 def _get_video_duration(path: Path) -> float:
@@ -247,6 +267,72 @@ def _transcode_to_h264(src: Path, dst: Path) -> bool:
     except subprocess.TimeoutExpired:
         print("[transcode] ffmpeg timeout after 10 minutes")
         return False
+
+
+def _web_playable_cache_path(src: Path) -> Path:
+    cache_dir = GALLERY_DIR / "_web"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / src.name
+
+
+def _ensure_web_playable_video(src: Path) -> Path:
+    """Return a browser-safe mp4 path for `src`.
+    We lazily transcode every served annotated file into a cache on first use,
+    then reuse that cache until the source file changes."""
+    cached = _web_playable_cache_path(src)
+    try:
+        if cached.exists() and cached.stat().st_mtime >= src.stat().st_mtime:
+            return cached
+    except OSError:
+        pass
+
+    tmp_cached = cached.with_suffix(cached.suffix + ".tmp.mp4")
+    if tmp_cached.exists():
+        try:
+            tmp_cached.unlink()
+        except OSError:
+            pass
+
+    if _transcode_to_h264(src, tmp_cached):
+        if cached.exists():
+            try:
+                cached.unlink()
+            except OSError:
+                pass
+        tmp_cached.rename(cached)
+        return cached
+
+    if tmp_cached.exists():
+        try:
+            tmp_cached.unlink()
+        except OSError:
+            pass
+    return src
+
+
+def _annotated_thumbnail_path(filename: str) -> Path:
+    thumbs_dir = GALLERY_DIR / "_thumbs"
+    thumbs_dir.mkdir(parents=True, exist_ok=True)
+    return thumbs_dir / f"{filename}.jpg"
+
+
+def _ensure_annotated_thumbnail(filename: str) -> Path | None:
+    video_path = ANNOTATED_DIR / filename
+    if not video_path.exists():
+        return None
+
+    thumb_path = _annotated_thumbnail_path(filename)
+    try:
+        if thumb_path.exists() and thumb_path.stat().st_mtime >= video_path.stat().st_mtime:
+            return thumb_path
+    except OSError:
+        pass
+
+    duration = _get_video_duration(video_path)
+    thumb_at = max(0.5, duration * 0.1)
+    if _extract_thumbnail(video_path, thumb_path, at_seconds=thumb_at):
+        return thumb_path
+    return None
 
 
 def _shot_to_event(shot: dict, index: int, roster: dict | None = None) -> dict:
@@ -561,23 +647,24 @@ def _snapshot_to_gallery(
     annotated_output: Path,
     title: str,
 ) -> str:
-    """Copy the just-annotated pair into Gallery/<sid>/, extract a thumbnail,
-    and persist a metadata + shots + roster snapshot to Mongo. Returns the
-    session id. Raises on unrecoverable errors; caller catches and logs."""
+    """Archive the current annotation: keep the raw input + thumbnail under
+    server/Gallery/<sid>/, store the archived video under server/Annotated/,
+    and persist a metadata + shots + roster snapshot to Mongo."""
     session_id = uuid.uuid4().hex
     session_dir = GALLERY_DIR / session_id
     session_dir.mkdir(parents=True, exist_ok=True)
 
     input_copy = session_dir / "input.mp4"
-    output_copy = session_dir / "output.mp4"
     thumb_copy = session_dir / "thumb.jpg"
+    archived_output_name = f"{session_id}.mp4"
+    archived_output = ANNOTATED_DIR / archived_output_name
 
     shutil.copy2(raw_input, input_copy)
-    shutil.copy2(annotated_output, output_copy)
+    shutil.copy2(annotated_output, archived_output)
 
-    duration = _get_video_duration(output_copy)
+    duration = _get_video_duration(archived_output)
     thumb_at = max(0.5, duration * 0.1)
-    _extract_thumbnail(output_copy, thumb_copy, at_seconds=thumb_at)
+    _extract_thumbnail(archived_output, thumb_copy, at_seconds=thumb_at)
 
     # Pull shots + roster from Mongo as they stand right now — these were just
     # written by `replace_video_session` above.
@@ -589,7 +676,7 @@ def _snapshot_to_gallery(
         title=title.strip() or f"session-{session_id[:8]}",
         duration_seconds=duration,
         input_video_relpath=f"{session_id}/input.mp4",
-        annotated_video_relpath=f"{session_id}/output.mp4",
+        annotated_video_relpath=archived_output_name,
         thumbnail_relpath=f"{session_id}/thumb.jpg",
         shots=current_shots,
         roster=current_roster,
@@ -604,6 +691,8 @@ async def send_video(filename: str):
 
     if not video_path.exists() or not video_path.is_file():
         raise HTTPException(status_code=404, detail="Video Not Found")
+
+    video_path = _ensure_web_playable_video(video_path)
 
     # Serve as inline video (not a download) so <video> can stream it.
     return FileResponse(
@@ -634,10 +723,60 @@ def _gallery_entry_public(entry: dict) -> dict:
     }
 
 
+def _scanned_gallery_entries() -> list[dict]:
+    gallery_entries = list_gallery_sessions()
+    gallery_by_video = {
+        str(entry.get("annotated_video_relpath") or ""): entry
+        for entry in gallery_entries
+        if entry.get("annotated_video_relpath")
+    }
+    current_session = fetch_current_session() or {}
+    current_shots = fetch_shots()
+
+    scanned: list[dict] = []
+    for video_path in sorted(
+        ANNOTATED_DIR.glob("*.mp4"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    ):
+        filename = video_path.name
+        if filename in gallery_by_video:
+            entry = gallery_by_video[filename]
+            public = _gallery_entry_public(entry)
+            public["video_url"] = f"/videoSend/{filename}"
+            scanned.append(public)
+            continue
+
+        created_at = datetime.fromtimestamp(
+            video_path.stat().st_mtime, tz=timezone.utc
+        ).isoformat()
+        shot_count = 0
+        if filename == "output.mp4":
+            created = current_session.get("processed_at")
+            if hasattr(created, "isoformat"):
+                created_at = created.isoformat()
+            elif created:
+                created_at = str(created)
+            shot_count = int(current_session.get("shot_count") or len(current_shots))
+
+        scanned.append(
+            {
+                "session_id": _annotated_session_id(filename),
+                "title": filename,
+                "created_at": created_at,
+                "duration_seconds": _get_video_duration(video_path),
+                "shot_count": shot_count,
+                "thumbnail_url": f"/api/gallery/annotated/{filename}/thumbnail",
+                "video_url": f"/videoSend/{filename}",
+            }
+        )
+
+    return scanned
+
+
 @app.get("/api/gallery")
 async def gallery_list():
-    entries = list_gallery_sessions()
-    return [_gallery_entry_public(e) for e in entries]
+    return _scanned_gallery_entries()
 
 
 class SaveCurrentRequest(BaseModel):
@@ -688,9 +827,21 @@ async def gallery_thumbnail(session_id: str):
     return FileResponse(path=thumb_path, media_type="image/jpeg")
 
 
+@app.get("/api/gallery/annotated/{filename}/thumbnail")
+async def gallery_annotated_thumbnail(filename: str):
+    thumb_path = _ensure_annotated_thumbnail(filename)
+    if thumb_path is None or not thumb_path.exists():
+        raise HTTPException(status_code=404, detail="Thumbnail not found")
+    return FileResponse(path=thumb_path, media_type="image/jpeg")
+
+
 @app.get("/api/gallery/{session_id}/video")
 async def gallery_video(session_id: str):
-    video_path = GALLERY_DIR / session_id / "output.mp4"
+    entry = get_gallery_session(session_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Gallery session not found")
+    video_name = entry.get("annotated_video_relpath")
+    video_path = ANNOTATED_DIR / str(video_name)
     if not video_path.exists():
         raise HTTPException(status_code=404, detail="Gallery video not found")
     return FileResponse(path=video_path, media_type="video/mp4")
@@ -702,13 +853,40 @@ async def gallery_load(session_id: str):
     `Uploads/input.mp4` + `Annotated/output.mp4` slots both get replaced with
     the gallery entry's files. The Film page's existing /api/video/info flow
     then picks it up like a fresh upload."""
+    filename = _annotated_filename_from_session_id(session_id)
+    if filename is not None:
+        video_path = ANNOTATED_DIR / filename
+        if not video_path.exists():
+            raise HTTPException(status_code=404, detail="Gallery video not found")
+
+        current_input = UPLOAD_DIR / "input.mp4"
+        current_output = ANNOTATED_DIR / "output.mp4"
+        if current_input.exists():
+            try:
+                current_input.unlink()
+            except OSError:
+                pass
+        if filename != "output.mp4":
+            if current_output.exists():
+                try:
+                    current_output.unlink()
+                except OSError:
+                    pass
+            shutil.copy2(video_path, current_output)
+            clear_current_session()
+        return {
+            "loaded": True,
+            "session_id": session_id,
+            "title": filename,
+        }
+
     entry = load_gallery_session_as_current(session_id)
     if not entry:
         raise HTTPException(status_code=404, detail="Gallery session not found")
 
     session_dir = GALLERY_DIR / session_id
     gallery_input = session_dir / "input.mp4"
-    gallery_output = session_dir / "output.mp4"
+    gallery_output = ANNOTATED_DIR / str(entry.get("annotated_video_relpath"))
     if not gallery_output.exists():
         raise HTTPException(
             status_code=410,
@@ -739,10 +917,58 @@ async def gallery_load(session_id: str):
 
 @app.delete("/api/gallery/{session_id}")
 async def gallery_delete(session_id: str):
+    filename = _annotated_filename_from_session_id(session_id)
+    if filename is not None:
+        removed: list[str] = []
+        cached_path = _web_playable_cache_path(ANNOTATED_DIR / filename)
+        if filename == "output.mp4":
+            clear_current_session()
+            if cached_path.exists():
+                try:
+                    cached_path.unlink()
+                except OSError:
+                    pass
+            for path in (UPLOAD_DIR / "input.mp4", ANNOTATED_DIR / "output.mp4"):
+                if path.exists():
+                    try:
+                        path.unlink()
+                        removed.append(str(path))
+                    except OSError:
+                        pass
+        else:
+            video_path = ANNOTATED_DIR / filename
+            if video_path.exists():
+                try:
+                    video_path.unlink()
+                    removed.append(str(video_path))
+                except OSError:
+                    pass
+            thumb_path = _annotated_thumbnail_path(filename)
+            if thumb_path.exists():
+                try:
+                    thumb_path.unlink()
+                except OSError:
+                    pass
+            if cached_path.exists():
+                try:
+                    cached_path.unlink()
+                except OSError:
+                    pass
+        return {"deleted": True, "session_id": session_id, "removed": removed}
+
+    entry = get_gallery_session(session_id)
     removed = delete_gallery_session(session_id)
     session_dir = GALLERY_DIR / session_id
     if session_dir.exists():
         shutil.rmtree(session_dir, ignore_errors=True)
+    if entry:
+        archived_video = ANNOTATED_DIR / str(entry.get("annotated_video_relpath"))
+        current_output = ANNOTATED_DIR / "output.mp4"
+        if archived_video.exists() and archived_video != current_output:
+            try:
+                archived_video.unlink()
+            except OSError:
+                pass
     if not removed:
         raise HTTPException(status_code=404, detail="Gallery session not found")
     return {"deleted": True, "session_id": session_id}
@@ -878,15 +1104,21 @@ async def chat(req: ChatRequest):
 
 @app.delete("/api/video")
 async def delete_video():
-    """Wipe uploads/ and Annotated/ so the player falls back to the
-    upload backboard. Called from the close (X) button in the player."""
+    """Clear only the current Uploads/input.mp4 and Annotated/output.mp4 slots.
+    Archived gallery copies under server/Annotated remain intact."""
+    clear_current_session()
     removed = []
-    for folder in (UPLOAD_DIR, ANNOTATED_DIR):
-        if folder.exists():
-            for mp4 in folder.glob("*.mp4"):
-                try:
-                    mp4.unlink()
-                    removed.append(str(mp4))
-                except OSError:
-                    pass
+    cached_output = _web_playable_cache_path(ANNOTATED_DIR / "output.mp4")
+    if cached_output.exists():
+        try:
+            cached_output.unlink()
+        except OSError:
+            pass
+    for path in (UPLOAD_DIR / "input.mp4", ANNOTATED_DIR / "output.mp4"):
+        if path.exists():
+            try:
+                path.unlink()
+                removed.append(str(path))
+            except OSError:
+                pass
     return {"removed": removed}

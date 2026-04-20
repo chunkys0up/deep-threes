@@ -97,6 +97,22 @@ def fetch_shots() -> list[dict[str, Any]]:
         return []
 
 
+def fetch_current_session() -> dict[str, Any] | None:
+    try:
+        return session_collection.find_one({}, {"_id": 0})
+    except (ServerSelectionTimeoutError, PyMongoError) as e:
+        print(f"[db] session fetch failed ({e.__class__.__name__}); returning None")
+        return None
+
+
+def clear_current_session() -> None:
+    try:
+        shots_collection.delete_many({})
+        session_collection.delete_many({})
+    except (ServerSelectionTimeoutError, PyMongoError) as e:
+        print(f"[db] session clear failed ({e.__class__.__name__})")
+
+
 # ---------------------------------------------------------------------------
 # Roster — jersey-number → player name + team display name hashmap.
 # Single-doc collection keyed by _id="current"; the whole mapping is replaced
