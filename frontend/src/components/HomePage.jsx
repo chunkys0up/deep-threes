@@ -34,12 +34,7 @@ export default function HomePage({ onNavigate }) {
             </button>
           </div>
 
-          <img
-            className="home-hero-logo"
-            src={logo}
-            alt="Deep 3s"
-            aria-hidden="true"
-          />
+
         </div>
       </div>
     </div>

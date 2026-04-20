@@ -316,6 +316,14 @@ def _annotated_thumbnail_path(filename: str) -> Path:
     return thumbs_dir / f"{filename}.jpg"
 
 
+def _event_thumbnail_path(filename: str, index: int, timestamp: float) -> Path:
+    thumbs_dir = GALLERY_DIR / "_event_thumbs"
+    thumbs_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", filename)
+    time_key = int(round(float(timestamp) * 1000.0))
+    return thumbs_dir / f"{safe_name}.{index}.{time_key}.jpg"
+
+
 def _ensure_annotated_thumbnail(filename: str) -> Path | None:
     video_path = ANNOTATED_DIR / filename
     if not video_path.exists():
@@ -335,6 +343,24 @@ def _ensure_annotated_thumbnail(filename: str) -> Path | None:
     return None
 
 
+def _ensure_event_thumbnail(filename: str, index: int, timestamp: float) -> Path | None:
+    video_path = ANNOTATED_DIR / filename
+    if not video_path.exists():
+        return None
+
+    thumb_path = _event_thumbnail_path(filename, index, timestamp)
+    try:
+        if thumb_path.exists() and thumb_path.stat().st_mtime >= video_path.stat().st_mtime:
+            return thumb_path
+    except OSError:
+        pass
+
+    clamped_time = max(0.0, float(timestamp))
+    if _extract_thumbnail(video_path, thumb_path, at_seconds=clamped_time):
+        return thumb_path
+    return None
+
+
 def _shot_to_event(shot: dict, index: int, roster: dict | None = None) -> dict:
     """Translate a Mongo shot doc into the {time, description, thumbnail}
     shape the frontend seekbar + thumbnails strip consumes.
@@ -345,6 +371,7 @@ def _shot_to_event(shot: dict, index: int, roster: dict | None = None) -> dict:
     team_detected = (shot.get("team_name") or "").strip()
     jersey = shot.get("player_number")
     timestamp = float(shot.get("timestamp_seconds") or 0)
+    video_name = str(shot.get("annotated_video") or "output.mp4")
 
     # Roster lookup — falls back to detected values if no override is set.
     team_override, player_override = resolve_player(team_detected, jersey, roster)
@@ -374,7 +401,10 @@ def _shot_to_event(shot: dict, index: int, roster: dict | None = None) -> dict:
     return {
         "time": round(timestamp, 2),
         "description": " ".join(parts),
-        "thumbnail": f"https://picsum.photos/seed/shot{index}/120/68",
+        "thumbnail": (
+            f"http://localhost:8000/api/video/thumbnail/{index}"
+            f"?filename={video_name}&time={timestamp:.3f}"
+        ),
     }
 
 
@@ -495,6 +525,14 @@ async def video_info():
 async def video_timestamps(duration: float | None = None):
     _shots, events = _all_events()
     return events
+
+
+@app.get("/api/video/thumbnail/{index}")
+async def video_timestamp_thumbnail(index: int, filename: str, time: float):
+    thumb_path = _ensure_event_thumbnail(filename, index, time)
+    if thumb_path is None or not thumb_path.exists():
+        raise HTTPException(status_code=404, detail="Thumbnail not found")
+    return FileResponse(path=thumb_path, media_type="image/jpeg")
 
 
 @app.get("/api/shots")
